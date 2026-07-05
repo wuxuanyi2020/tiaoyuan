@@ -1,0 +1,27 @@
+# 运行结果
+result/
+*.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 视频文件（体积大，不上传）
+videos/
+*.mp4
+*.avi
+*.mov
+
+# 系统
+*.log
+Thumbs.db
+.DS_Store
+
+# 临时测试
+test_*.py
+stderr.log
