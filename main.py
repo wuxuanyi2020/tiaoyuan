@@ -41,8 +41,8 @@ def build_parser():
     parser.add_argument("--takeoff-offset-cm", type=float, default=0.0)
     parser.add_argument("--manual-calib", action="store_true", help="手动四点标定（需鼠标点击）")
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
-    parser.add_argument("--landing-offset-cm", type=float, default=-7.0,
-                        help="落地点修正值(cm)，补偿鞋后跟厚度，默认-7.0（负值缩短距离）")
+    parser.add_argument("--landing-offset-cm", type=float, default=-5.0,
+                        help="落地点修正值(cm)，补偿鞋后跟厚度，默认-5.0（负值缩短距离）")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
     parser.add_argument("--videos", nargs="*", default=None, help="批量处理指定的视频列表")

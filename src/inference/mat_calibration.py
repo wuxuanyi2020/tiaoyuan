@@ -210,3 +210,99 @@ class MatCalibrator:
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         return mask
+
+    # ──────── 人体轮廓检测（替代骨架关键点） ────────
+
+    def get_person_mask(self, frame, morphology_close=True):
+        """通过垫子绿色反色提取垫子上的人体轮廓二值图（白色=人体）。"""
+        if frame is None or not self.calibrated:
+            return None
+        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        green_mask = cv2.inRange(hsv, np.array([20, 30, 30]), np.array([95, 255, 255]))
+        person = cv2.bitwise_not(green_mask)  # 非绿色 = 人体/衣物/鞋子
+        # 仅保留垫子区域内的非绿色像素
+        if self._smooth_box is not None:
+            box_mask = np.zeros_like(person)
+            cv2.fillPoly(box_mask, [self._smooth_box.astype(np.int32)], 255)
+            person = cv2.bitwise_and(person, box_mask)
+        kernel = np.ones((5, 5), np.uint8)
+        person = cv2.morphologyEx(person, cv2.MORPH_OPEN, kernel, iterations=1)
+        if morphology_close:
+            person = cv2.morphologyEx(person, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # 去掉小噪点：只保留最大轮廓
+        contours, _ = cv2.findContours(person, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            person = np.zeros_like(person)
+            cv2.drawContours(person, [largest], -1, 255, -1)
+        return person
+
+    def get_person_area_px(self, frame):
+        """返回垫子内人体轮廓的面积（像素数）。0 = 无人/人在空中。"""
+        mask = self.get_person_mask(frame, morphology_close=False)
+        if mask is None:
+            return 0.0
+        return float(cv2.countNonZero(mask))
+
+    def get_person_front_x_cm(self, frame):
+        """获取人体最靠前（X 最大=脚尖）的位置(cm)，用于起跳点确认。"""
+        mask = self.get_person_mask(frame)
+        if mask is None:
+            return None
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return None
+        # 最靠前的点 = X 最大的像素
+        max_x_idx = np.argmax(xs)
+        cm = self.transform_to_mat_cm((float(xs[max_x_idx]), float(ys[max_x_idx])))
+        return cm[0] if cm is not None else None
+
+    def get_person_back_x_cm(self, frame):
+        """获取人体最靠后（X 最小=脚后跟）的位置(cm)，用于落地判定。"""
+        mask = self.get_person_mask(frame)
+        if mask is None:
+            return None
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return None
+        # 最靠后的点 = X 最小的像素（靠近起跳线侧）
+        min_x_idx = np.argmin(xs)
+        cm = self.transform_to_mat_cm((float(xs[min_x_idx]), float(ys[min_x_idx])))
+        return cm[0] if cm is not None else None
+
+    def get_person_centroid_x_cm(self, frame):
+        """获取人体轮廓重心 X (cm)。"""
+        mask = self.get_person_mask(frame)
+        if mask is None:
+            return None
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return None
+        cx = float(np.mean(xs))
+        cy = float(np.mean(ys))
+        cm = self.transform_to_mat_cm((cx, cy))
+        return cm[0] if cm is not None else None
+
+    def get_person_bottom_y_px(self, frame):
+        """获取人体轮廓最底部（Y 最大）的像素坐标，用于判断脚是否离垫。"""
+        mask = self.get_person_mask(frame, morphology_close=True)
+        if mask is None:
+            return None
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0:
+            return None
+        max_y_idx = np.argmax(ys)  # Y 最大 = 图像底部 = 脚的位置
+        return float(ys[max_y_idx])
+
+    def get_person_bottom_x_cm(self, frame):
+        """获取人体轮廓最底部（Y 最大）处的 X(cm)，用于落地点。"""
+        mask = self.get_person_mask(frame, morphology_close=True)
+        if mask is None:
+            return None
+        ys, xs = np.where(mask > 0)
+        if len(ys) == 0:
+            return None
+        max_y_idx = np.argmax(ys)
+        cm = self.transform_to_mat_cm((float(xs[max_y_idx]), float(ys[max_y_idx])))
+        return cm[0] if cm is not None else None

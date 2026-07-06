@@ -24,7 +24,7 @@ class JumpConfig:
     manual_calib: bool = False
     result_dir: str | None = None  # 结果输出根目录，由 main 在运行时传入
     enable_foul_detection: bool = True
-    landing_offset_cm: float = -7.0  # 落地点修正（鞋跟厚度补偿）
+    landing_offset_cm: float = -4.0  # 落地点修正（鞋跟厚度补偿）
 
 
 def resolve_video_source(value):
