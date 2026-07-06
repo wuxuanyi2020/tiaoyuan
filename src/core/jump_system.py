@@ -96,8 +96,7 @@ class StandingLongJumpSystem:
         self.record_writer = None
 
         self.takeoff_display_offset_cm = float(config.takeoff_offset_cm)
-        self.landing_display_offset_cm = -7.0
-        self.landing_point_offset_cm = 0.0
+        self.landing_offset_cm = float(config.landing_offset_cm)
 
         if config.display:
             cv2.namedWindow("Auto Long Jump", cv2.WINDOW_NORMAL)
@@ -285,7 +284,7 @@ class StandingLongJumpSystem:
             ld_cm = self.calibrator.transform_to_mat_cm(self.landing_pt_px)
             if ld_cm is not None:
                 raw_ld_x = ld_cm[0]
-                self.final_distance_cm = max(0.0, float(raw_ld_x) - self.takeoff_x_cm + self.landing_display_offset_cm)
+                self.final_distance_cm = max(0.0, float(raw_ld_x) - self.takeoff_x_cm + self.landing_offset_cm)
                 self.landing_x_cm = self.takeoff_x_cm + self.final_distance_cm
                 self.foul_detector.check_out_of_bounds(ld_cm)
 
@@ -421,7 +420,7 @@ class StandingLongJumpSystem:
         temp_dist = 0.0
         temp_cm_pt = self.calibrator.transform_to_mat_cm(landing_xy_candidate)
         if temp_cm_pt is not None:
-            temp_dist = temp_cm_pt[0] - (self.takeoff_x_cm if self.takeoff_x_cm else 0.0) + self.landing_display_offset_cm
+            temp_dist = temp_cm_pt[0] - (self.takeoff_x_cm if self.takeoff_x_cm else 0.0) + self.landing_offset_cm
 
         if temp_dist < 50.0:
             self._log("LAND", f"忽略假动作 (距离 {temp_dist:.1f} cm 过短)，重置为 READY")

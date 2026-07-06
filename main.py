@@ -38,9 +38,11 @@ def build_parser():
     parser.add_argument("--min-flight-frames", type=int, default=5)
     parser.add_argument("--max-jump-frames", type=int, default=120)
     parser.add_argument("--takeoff-line-cm", type=float, default=32.0)
-    parser.add_argument("--takeoff-offset-cm", type=float, default=4.0)
+    parser.add_argument("--takeoff-offset-cm", type=float, default=0.0)
     parser.add_argument("--manual-calib", action="store_true", help="手动四点标定（需鼠标点击）")
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
+    parser.add_argument("--landing-offset-cm", type=float, default=-7.0,
+                        help="落地点修正值(cm)，补偿鞋后跟厚度，默认-7.0（负值缩短距离）")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
     parser.add_argument("--videos", nargs="*", default=None, help="批量处理指定的视频列表")
@@ -77,6 +79,7 @@ def run_single(video_path, args):
         manual_calib=args.manual_calib,
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
+        landing_offset_cm=args.landing_offset_cm,
     )
     StandingLongJumpSystem(config).run()
 
@@ -179,6 +182,7 @@ def main():
         manual_calib=args.manual_calib,
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
+        landing_offset_cm=args.landing_offset_cm,
     )
     StandingLongJumpSystem(config).run()
 
