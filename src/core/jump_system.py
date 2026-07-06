@@ -37,6 +37,7 @@ class StandingLongJumpSystem:
             get_kpt=self._get_kpt,
             get_feet=self._get_feet,
             transform_to_mat_cm=self.calibrator.transform_to_mat_cm,
+            enabled=config.enable_foul_detection,
         )
 
         # --- 结果目录 & 日志 ---

@@ -38,8 +38,9 @@ def build_parser():
     parser.add_argument("--min-flight-frames", type=int, default=5)
     parser.add_argument("--max-jump-frames", type=int, default=120)
     parser.add_argument("--takeoff-line-cm", type=float, default=32.0)
-    parser.add_argument("--takeoff-offset-cm", type=float, default=0.0)
+    parser.add_argument("--takeoff-offset-cm", type=float, default=4.0)
     parser.add_argument("--manual-calib", action="store_true", help="手动四点标定（需鼠标点击）")
+    parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
     parser.add_argument("--videos", nargs="*", default=None, help="批量处理指定的视频列表")
@@ -60,7 +61,7 @@ def run_single(video_path, args):
     config = JumpConfig(
         video_source=video_path,
         save_path=save_path,
-        display=False,  # 批量模式下不显示窗口
+        display=False,
         model=args.model,
         backend=args.backend,
         debug_dir=args.debug_dir,
@@ -75,6 +76,7 @@ def run_single(video_path, args):
         takeoff_offset_cm=args.takeoff_offset_cm,
         manual_calib=args.manual_calib,
         result_dir=result_dir,
+        enable_foul_detection=not args.no_foul_detection,
     )
     StandingLongJumpSystem(config).run()
 
@@ -176,6 +178,7 @@ def main():
         takeoff_offset_cm=args.takeoff_offset_cm,
         manual_calib=args.manual_calib,
         result_dir=result_dir,
+        enable_foul_detection=not args.no_foul_detection,
     )
     StandingLongJumpSystem(config).run()
 
