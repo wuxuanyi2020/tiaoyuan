@@ -570,6 +570,11 @@ class StandingLongJumpSystem:
                     if not self.calibrator.mat_locked:
                         self.calibrator.mat_locked = True
                         self._log("CALIB", "垫子标定完成")
+                        # 保存垫子二值识别图
+                        mask = self.calibrator.render_mask(frame)
+                        if mask is not None and self.images_dir:
+                            mask_path = os.path.join(self.images_dir, "mat_mask.jpeg")
+                            imwrite_safe(mask_path, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
 
                 if self.calibrator.calibrated and kpts is not None:
                     ankles = self._get_feet(kpts, "ankle")

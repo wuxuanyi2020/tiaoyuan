@@ -181,3 +181,21 @@ class MatCalibrator:
         scale = float(self.mat_view_scale)
         S = np.array([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
         return S @ self.H_img2mat
+
+    def render_mask(self, frame):
+        """生成 2 色垫子识别图：垫子区域=白色(255), 背景=黑色(0)。"""
+        if frame is None:
+            return None
+        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        lower_green = np.array([20, 30, 30])
+        upper_green = np.array([95, 255, 255])
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        # 仅在已标定框内保留白色
+        if self._smooth_box is not None:
+            box_img = np.zeros_like(mask)
+            cv2.fillPoly(box_img, [self._smooth_box.astype(np.int32)], 255)
+            mask = cv2.bitwise_and(mask, box_img)
+        return mask
