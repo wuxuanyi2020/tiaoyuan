@@ -43,9 +43,9 @@ def resolve_video_source(value):
 
 
 def make_result_dir(video_name: str) -> str:
-    """创建带时间标签的结果文件夹。"""
+    """创建带时间标签的结果文件夹（result/<视频名>/<视频名>_<时间戳>/）。"""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.join("result", f"{video_name}_{ts}")
+    base = os.path.join("result", video_name, f"{video_name}_{ts}")
     os.makedirs(base, exist_ok=True)
     os.makedirs(os.path.join(base, "images"), exist_ok=True)
     os.makedirs(os.path.join(base, "logs"), exist_ok=True)
