@@ -100,23 +100,25 @@ class PoseEstimator:
 
     def _ensure_pose_landmarker_model(self):
         urls = [
-            "https://cdn.jsdelivr.net/gh/google-ai-edge/mediapipe@master/mediapipe/tasks/testdata/vision/pose_landmarker_full.task",
-            "https://mirror.ghproxy.com/https://raw.githubusercontent.com/google-ai-edge/mediapipe/master/mediapipe/tasks/testdata/vision/pose_landmarker_full.task",
-            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+            "https://cdn.jsdelivr.net/gh/google-ai-edge/mediapipe@master/mediapipe/tasks/testdata/vision/pose_landmarker_heavy.task",
+            "https://mirror.ghproxy.com/https://raw.githubusercontent.com/google-ai-edge/mediapipe/master/mediapipe/tasks/testdata/vision/pose_landmarker_heavy.task",
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
         ]
         base_dir = os.path.join(os.path.expanduser("~"), ".mediapipe")
         os.makedirs(base_dir, exist_ok=True)
-        dst = os.path.join(base_dir, "pose_landmarker_full.task")
+        dst = os.path.join(base_dir, "pose_landmarker_heavy.task")
         if os.path.exists(dst) and os.path.getsize(dst) > 1024:
+            print(f">>> 使用已有模型: {dst} ({os.path.getsize(dst)//1024}KB)")
             return dst
 
-        print("正在下载 MediaPipe 模型 (pose_landmarker_full.task)...")
+        print("正在下载 MediaPipe Heavy 模型 (pose_landmarker_heavy.task)...")
         tmp = dst + ".tmp"
         for url in urls:
             try:
                 self._download_file(url, tmp)
                 if os.path.exists(tmp) and os.path.getsize(tmp) > 1024:
                     os.replace(tmp, dst)
+                    print(f">>> 下载完成: {dst} ({os.path.getsize(dst)//1024}KB)")
                     return dst
             except Exception:
                 continue
