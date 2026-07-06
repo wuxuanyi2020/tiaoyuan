@@ -459,8 +459,17 @@ class StandingLongJumpSystem:
                                       self.landing_x_cm, (0, 0, 255))
         self.renderer.draw_measurement_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
                                             self.takeoff_x_cm, self.landing_x_cm)
+        # 左上角标注成绩
+        score_text = f"成绩: {self.final_distance_cm:.1f} cm" if self.final_distance_cm is not None else "成绩: 无"
+        takeoff_text = f"起跳点: {self.takeoff_x_cm:.1f} cm" if self.takeoff_x_cm is not None else ""
+        landing_text = f"落地点: {self.landing_x_cm:.1f} cm" if self.landing_x_cm is not None else ""
+        img = self.renderer.put_text_chinese(img, score_text, (50, 80), (0, 255, 0), size=50)
+        if takeoff_text:
+            img = self.renderer.put_text_chinese(img, takeoff_text, (50, 140), (255, 255, 0), size=30)
+        if landing_text:
+            img = self.renderer.put_text_chinese(img, landing_text, (50, 180), (255, 255, 0), size=30)
         if self.foul_detector.reason:
-            img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, 150), (0, 0, 255), size=50)
+            img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, 230), (0, 0, 255), size=50)
 
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = os.path.join(self.images_dir, f"landed-{ts}.jpeg") if self.images_dir else f"landed-{ts}.jpeg"
