@@ -43,6 +43,12 @@ def build_parser():
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
     parser.add_argument("--landing-offset-cm", type=float, default=-5.0,
                         help="落地点修正值(cm)，补偿鞋后跟厚度，默认-5.0（负值缩短距离）")
+    parser.add_argument("--detection-method", type=str, default="contour",
+                        choices=["contour", "skeleton"],
+                        help="检测方式: contour(差分法, 默认) / skeleton(骨骼关键点法)")
+    parser.add_argument("--shoe-detection", type=str, default="canny",
+                        choices=["canny", "yolo"],
+                        help="鞋底检测方法: canny(边缘检测, 默认) / yolo(YOLOv10-seg实例分割)")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
     parser.add_argument("--videos", nargs="*", default=None, help="批量处理指定的视频列表")
@@ -80,6 +86,8 @@ def run_single(video_path, args):
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
+        detection_method=args.detection_method,
+        shoe_detection=args.shoe_detection,
     )
     StandingLongJumpSystem(config).run()
 
@@ -183,6 +191,8 @@ def main():
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
+        detection_method=args.detection_method,
+        shoe_detection=args.shoe_detection,
     )
     StandingLongJumpSystem(config).run()
 

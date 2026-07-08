@@ -88,8 +88,9 @@ class StandingLongJumpSystem:
         self._ready_missing_frames = 0
         self._jump_frame_counter = 0
         self._takeoff_recorded_x = None
-        self._landing_stable_counter = 0
         self._landing_stable_counter = 0  # ROI 鞋子落地连续确认帧数
+        self._ready_last_frame_img = None
+        self._ready_last_kpts = None
 
         # ── 骨骼关键点法状态变量 ──
         self._skeleton_baseline_x_cm = None
@@ -192,6 +193,8 @@ class StandingLongJumpSystem:
         self._jump_frame_counter = 0
         self._takeoff_recorded_x = None
         self._landing_stable_counter = 0
+        self._ready_last_frame_img = None
+        self._ready_last_kpts = None
         # 骨架法变量
         self._skeleton_baseline_x_cm = None
         self._skeleton_baseline_hip_x = None
@@ -346,6 +349,8 @@ class StandingLongJumpSystem:
             self._person_area_baseline = 0.95 * self._person_area_baseline + 0.05 * area
             self._ready_stable_frames += 1
             self._ready_missing_frames = 0
+            self._ready_last_frame_img = frame.copy()
+            self._ready_last_kpts = self._last_kpts.copy() if self._last_kpts is not None else None
 
             # 每10帧 Debug
             if frame_idx % 10 == 0:
@@ -384,7 +389,12 @@ class StandingLongJumpSystem:
 
             self._log("JUMP", f"起跳成功！稳定期={self._ready_stable_frames}帧, "
                               f"起跳点={takeoff_x:.1f}cm (前缘均值, N={len(self._front_x_cm_hist)})")
-            self._save_diff_image("takeoff", self._prev_frame_img if self._prev_frame_img is not None else frame)
+            base_frame = self._ready_last_frame_img if self._ready_last_frame_img is not None else frame
+            self._save_diff_image("takeoff", base_frame)
+            base_kpts = self._ready_last_kpts if self._ready_last_kpts is not None else self._last_kpts
+            if base_kpts is not None:
+                _, _, debug = self.calibrator.detect_shoe_front_x_cm(base_frame, base_kpts, return_steps=True)
+                self._save_roi_debug("takeoff", debug, frame_idx)
 
             # 犯规检测（依赖骨架关键点）
             if self.foul_detector.enabled and self._last_kpts is not None:
@@ -402,7 +412,7 @@ class StandingLongJumpSystem:
             self.takeoff_x_cm = takeoff_x + self.takeoff_display_offset_cm
             self.takeoff_pt_px = None
             self.takeoff_pt_xy = None
-            self._takeoff_frame_img = frame.copy()
+            self._takeoff_frame_img = base_frame.copy()
 
     def _handle_jumping(self, frame_idx, frame, kpts):
         self._jump_frame_counter += 1
@@ -414,7 +424,12 @@ class StandingLongJumpSystem:
 
         if self._jump_frame_counter >= self.config.min_flight_frames:
             if kpts is not None:
-                shoe_x, edge_vis = self.calibrator.get_shoe_landing_x_cm(frame, kpts)
+                if self.config.shoe_detection == "yolo":
+                    # YOLO 实例分割
+                    shoe_x, edge_vis = self._detect_shoe_yolo(frame, kpts)
+                else:
+                    # Canny 边缘检测
+                    shoe_x, edge_vis = self.calibrator.get_shoe_landing_x_cm(frame, kpts)
                 if shoe_x is not None and 0 < shoe_x < 350:
                     self._landing_stable_counter += 1
                     landing_x_from_shoe = shoe_x
@@ -431,11 +446,6 @@ class StandingLongJumpSystem:
         if not detected_landing and self._jump_frame_counter >= self.config.max_jump_frames:
             detected_landing = True
             self._log("LAND", f"落地超时({self.config.max_jump_frames}帧)，强制落地")
-
-        # 保存调试图（有鞋边缘检测结果时）
-        if edge_vis is not None and self.images_dir and self._jump_frame_counter % 5 == 0:
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:21]
-            imwrite_safe(os.path.join(self.images_dir, f"shoe-edge-f{frame_idx}-{ts}.jpeg"), edge_vis)
 
         if not detected_landing:
             return
@@ -467,6 +477,12 @@ class StandingLongJumpSystem:
         method = "ROI_shoe" if landing_x_from_shoe is not None else "backup_contour"
         self._log("LAND", f"落地触发({method}), landing_x={landing_x:.1f}, 距离={temp_dist:.1f}cm")
         self._save_diff_image("landing", frame)
+        if kpts is not None:
+            if self.config.shoe_detection == "yolo":
+                _, _, debug = self._detect_shoe_yolo(frame, kpts, return_steps=True)
+            else:
+                _, _, debug = self.calibrator.get_shoe_landing_x_cm(frame, kpts, return_steps=True)
+            self._save_roi_debug("landing", debug, frame_idx)
         self.state = "LANDED"
         self.landing_frame = frame_idx
         self.landing_pt_px = None
@@ -490,6 +506,79 @@ class StandingLongJumpSystem:
             filename = os.path.join(self.images_dir, f"diff-{tag}-{ts}.jpeg")
             imwrite_safe(filename, diff_img)
             self._log("DIFF", f"差分图已保存: {filename}")
+
+    def _detect_shoe_yolo(self, frame, kpts, return_steps=False):
+        """用 YOLOv10-seg 在脚部 ROI 上做实例分割，返回 (landing_x_cm, edge_vis, [debug])。"""
+        foot_configs = [
+            {"label": "left", "indices": [27, 29, 31]},
+            {"label": "right", "indices": [28, 30, 32]},
+        ]
+        best_x, best_vis, best_debug = None, None, None
+        fallback_debug = None
+
+        for cfg in foot_configs:
+            roi_result = self.calibrator._foot_roi(frame, kpts, cfg["indices"], expand=1.5, return_bgr=True)
+            if roi_result is None:
+                if return_steps and fallback_debug is None:
+                    fallback_debug = {"label": f"{cfg['label']}-no-roi-yolo", "frame_roi": frame.copy(),
+                                      "error": "_foot_roi returned None", "steps": {}}
+                continue
+            roi_bgr, origin_xy, roi_w, roi_h = roi_result
+            if return_steps:
+                x, vis, debug = self.calibrator.detect_shoe_yolo_seg(roi_bgr, origin_xy, return_steps=True)
+            else:
+                x, vis = self.calibrator.detect_shoe_yolo_seg(roi_bgr, origin_xy, return_steps=False)
+                debug = None
+
+            if x is not None and (best_x is None or x < best_x):
+                best_x, best_vis = x, vis
+                if return_steps and debug:
+                    debug["label"] = f"{cfg['label']}-yolo"
+                    debug["yolo_masks"] = debug.get("yolo_masks", 0)
+                    debug["yolo_bottom"] = debug.get("yolo_bottom", 0)
+                    best_debug = debug
+
+        if return_steps:
+            return best_x, best_vis, best_debug or fallback_debug
+        return best_x, best_vis
+
+    def _save_roi_debug(self, tag, debug, frame_idx):
+        if not self.images_dir:
+            return
+        if not debug:
+            return
+        # YOLO 模式额外日志
+        yolo_masks = debug.get("yolo_masks", -1)
+        yolo_bottom = debug.get("yolo_bottom", -1)
+        if yolo_masks >= 0:
+            print(f"[YOLO] {tag}: masks={yolo_masks}, bottom_pass={yolo_bottom}")
+        if "error" in debug:
+            print(f"[YOLO] {tag} error: {debug['error']}")
+        label = debug.get("label", "unknown")
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:21]
+
+        frame_roi = debug.get("frame_roi")
+        if frame_roi is not None:
+            imwrite_safe(os.path.join(self.images_dir, f"roi-{tag}-{label}-00-frame_roi-f{frame_idx}-{ts}.jpeg"), frame_roi)
+
+        steps = debug.get("steps") or {}
+        ordered = [
+            ("roi_gray", 10),
+            ("blurred", 20),
+            ("binary", 30),
+            ("edges_raw", 40),
+            ("edges_closed", 50),
+            ("contour_mask", 60),
+            ("edge_vis", 70),
+        ]
+        for key, order in ordered:
+            img = steps.get(key)
+            if img is None:
+                continue
+            out = img
+            if len(out.shape) == 2:
+                out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+            imwrite_safe(os.path.join(self.images_dir, f"roi-{tag}-{label}-{order:02d}-{key}-f{frame_idx}-{ts}.jpeg"), out)
 
     @staticmethod
     def _skeleton_detect_contact(hist):

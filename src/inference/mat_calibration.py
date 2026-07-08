@@ -1,6 +1,12 @@
 """垫子标定模块：垫子检测、透视变换、坐标转换。"""
 import cv2
 import numpy as np
+import os as _os
+
+# 设置 ultralytics 缓存目录到项目内（避免 Windows 权限问题）
+_os.environ.setdefault("ULTRALYTICS_SETTINGS_DIR",
+                       _os.path.join(_os.path.dirname(__file__), "..", "..", ".ultralytics_cache"))
+_os.makedirs(_os.environ["ULTRALYTICS_SETTINGS_DIR"], exist_ok=True)
 
 
 class MatCalibrator:
@@ -354,7 +360,7 @@ class MatCalibrator:
 
     # ──────── ROI 鞋子边缘检测（基于 MediaPipe 关键点） ────────
 
-    def _foot_roi(self, frame, kpts, foot_indices, expand=1.5):
+    def _foot_roi(self, frame, kpts, foot_indices, expand=1.5, return_bgr=False):
         """根据关键点列表计算脚部 ROI 矩形。
 
         参数:
@@ -362,10 +368,11 @@ class MatCalibrator:
             kpts: MediaPipe 关键点 (NormalizedLandmarkList)
             foot_indices: 关键点索引列表，如 [27, 29, 31] (左踝+脚跟+脚趾)
             expand: ROI 扩大倍数
+            return_bgr: 若为 True，返回 BGR 彩色图；否则返回灰度图
 
         返回:
-            (roi_gray, roi_origin_xy, roi_w, roi_h)
-            - roi_gray: 裁剪出的 ROI 灰度图
+            (roi_img, roi_origin_xy, roi_w, roi_h)
+            - roi_img: 裁剪出的 ROI 灰度图（默认）或 BGR 图（return_bgr=True）
             - roi_origin_xy: ROI 在原图的左上角 (x, y)
             - roi_w, roi_h: ROI 宽高
             - None 如果关键点缺失
@@ -376,7 +383,7 @@ class MatCalibrator:
             if kpt is None:
                 continue
             pts_px.append((int(kpt[0]), int(kpt[1])))
-        if len(pts_px) < 3:
+        if len(pts_px) < 2:
             return None
 
         h, w = frame.shape[:2]
@@ -394,6 +401,8 @@ class MatCalibrator:
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return None
+        if return_bgr:
+            return roi, (x1, y1), x2 - x1, y2 - y1
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         return roi_gray, (x1, y1), x2 - x1, y2 - y1
 
@@ -410,7 +419,7 @@ class MatCalibrator:
             return None
         return (x, y)
 
-    def detect_shoe_contour_px(self, roi_gray, roi_h=None):
+    def detect_shoe_contour_px(self, roi_gray, roi_h=None, return_steps=False):
         """对 ROI 灰度图做 Canny 边缘检测 + 轮廓筛选，返回鞋子轮廓像素点列表。
 
         步骤：
@@ -425,54 +434,79 @@ class MatCalibrator:
             (contour_pixels, edge_img) — contour_pixels 是 (N,2) 的像素坐标数组（相对 ROI），
             edge_img 是可视化边缘图（调试用）。找不到返回 (None, None)。
         """
-        # 高斯模糊
+        steps = None
+        if return_steps:
+            steps = {"roi_gray": roi_gray}
+
         blurred = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+        if steps is not None:
+            steps["blurred"] = blurred
 
-        # 自适应二值化
-        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 31, 5)
+        binary = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            5,
+        )
+        if steps is not None:
+            steps["binary"] = binary
 
-        # Canny 边缘
-        edges = cv2.Canny(binary, 30, 100)
+        edges_raw = cv2.Canny(binary, 30, 100)
+        if steps is not None:
+            steps["edges_raw"] = edges_raw
 
-        # 形态学闭运算补缺口
         kernel = np.ones((5, 5), np.uint8)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        edges_closed = cv2.morphologyEx(edges_raw, cv2.MORPH_CLOSE, kernel, iterations=2)
+        if steps is not None:
+            steps["edges_closed"] = edges_closed
 
-        # 找轮廓，选最大
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            if return_steps:
+                return None, None, steps
             return None, None
 
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
-        if area < 100:  # 太小的轮廓不是鞋
+        if area < 100:
+            if return_steps:
+                return None, None, steps
             return None, None
 
         # 落地过滤：轮廓底部必须接近 ROI 底部（鞋子贴地）
         if roi_h is not None:
             max_y = max(p[0][1] for p in largest)  # 轮廓底部 Y（ROI 相对坐标）
             if max_y < roi_h - 10:  # 底部距离 ROI 底边超过10px → 在空中，非落地
+                if return_steps:
+                    return None, None, steps
                 return None, None
 
-        # 提取轮廓所有像素
-        contour_mask = np.zeros_like(edges)
+        contour_mask = np.zeros_like(edges_closed)
         cv2.drawContours(contour_mask, [largest], -1, 255, -1)
+        if steps is not None:
+            steps["contour_mask"] = contour_mask
         ys, xs = np.where(contour_mask > 0)
         if len(xs) == 0:
+            if return_steps:
+                return None, None, steps
             return None, None
         pixels = np.column_stack((xs, ys))
 
-        # 可视化边缘图
         edge_vis = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
         cv2.drawContours(edge_vis, [largest], -1, (0, 255, 0), 2)
         # 标注后跟点（X 最小点）
         min_x_idx = np.argmin(xs)
         cv2.circle(edge_vis, (int(xs[min_x_idx]), int(ys[min_x_idx])), 4, (0, 0, 255), -1)
+        if steps is not None:
+            steps["edge_vis"] = edge_vis
 
+        if return_steps:
+            return pixels, edge_vis, steps
         return pixels, edge_vis
 
-    def get_shoe_landing_x_cm(self, frame, kpts):
+    def get_shoe_landing_x_cm(self, frame, kpts, return_steps=False):
         """基于 ROI 鞋子边缘检测的落地位置。
 
         取脚后跟轮廓中 X 最小的点（最靠近起跳线），换算到垫子坐标系。
@@ -489,14 +523,42 @@ class MatCalibrator:
 
         best_heel_x_cm = None
         best_edge_vis = None
+        best_debug = None
 
         for cfg in foot_configs:
             roi_result = self._foot_roi(frame, kpts, cfg["indices"], expand=1.5)
             if roi_result is None:
                 continue
             roi_gray, origin_xy, roi_w, roi_h = roi_result
-            contour_px, edge_vis = self.detect_shoe_contour_px(roi_gray, roi_h)
+            x1, y1 = int(origin_xy[0]), int(origin_xy[1])
+            x2, y2 = x1 + int(roi_w), y1 + int(roi_h)
+
+            if return_steps:
+                contour_px, edge_vis, steps = self.detect_shoe_contour_px(roi_gray, roi_h, return_steps=True)
+            else:
+                contour_px, edge_vis = self.detect_shoe_contour_px(roi_gray, roi_h, return_steps=False)
+                steps = None
+
+            if return_steps and steps is not None and contour_px is None:
+                frame_roi = frame.copy()
+                cv2.rectangle(frame_roi, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                fallback_debug = {
+                    "label": cfg["label"],
+                    "roi_rect": (x1, y1, x2, y2),
+                    "frame_roi": frame_roi,
+                    "steps": steps,
+                }
+
             if contour_px is None or edge_vis is None:
+                if return_steps and steps is not None and fallback_debug is None:
+                    frame_roi = frame.copy()
+                    cv2.rectangle(frame_roi, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    fallback_debug = {
+                        "label": f"{cfg['label']}-fallback",
+                        "roi_rect": (x1, y1, x2, y2),
+                        "frame_roi": frame_roi,
+                        "steps": steps,
+                    }
                 continue
 
             # 把 ROI 相对坐标 → 原图绝对坐标
@@ -515,10 +577,21 @@ class MatCalibrator:
             if best_heel_x_cm is None or heel_cm[0] < best_heel_x_cm:
                 best_heel_x_cm = heel_cm[0]
                 best_edge_vis = edge_vis
+                if return_steps:
+                    frame_roi = frame.copy()
+                    cv2.rectangle(frame_roi, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    best_debug = {
+                        "label": cfg["label"],
+                        "roi_rect": (x1, y1, x2, y2),
+                        "frame_roi": frame_roi,
+                        "steps": steps,
+                    }
 
+        if return_steps:
+            return best_heel_x_cm, best_edge_vis, best_debug
         return best_heel_x_cm, best_edge_vis
 
-    def detect_shoe_front_x_cm(self, frame, kpts):
+    def detect_shoe_front_x_cm(self, frame, kpts, return_steps=False):
         """基于 ROI 鞋子边缘检测的起跳点位置。
 
         取脚尖轮廓中 X 最大的点（离起跳线最远），换算到垫子坐标系。
@@ -533,14 +606,40 @@ class MatCalibrator:
 
         best_front_x_cm = None
         best_edge_vis = None
+        best_debug = None
+        fallback_debug = None
 
         for cfg in foot_configs:
             roi_result = self._foot_roi(frame, kpts, cfg["indices"], expand=1.5)
             if roi_result is None:
+                if return_steps and fallback_debug is None:
+                    fallback_debug = {
+                        "label": f"{cfg['label']}-no-roi",
+                        "frame_roi": frame.copy(),
+                        "error": "_foot_roi returned None",
+                        "steps": {},
+                    }
                 continue
             roi_gray, origin_xy, roi_w, roi_h = roi_result
-            contour_px, edge_vis = self.detect_shoe_contour_px(roi_gray, roi_h)
+            x1, y1 = int(origin_xy[0]), int(origin_xy[1])
+            x2, y2 = x1 + int(roi_w), y1 + int(roi_h)
+
+            if return_steps:
+                contour_px, edge_vis, steps = self.detect_shoe_contour_px(roi_gray, roi_h, return_steps=True)
+            else:
+                contour_px, edge_vis = self.detect_shoe_contour_px(roi_gray, roi_h, return_steps=False)
+                steps = None
+
             if contour_px is None or edge_vis is None:
+                if return_steps and steps is not None and fallback_debug is None:
+                    frame_roi = frame.copy()
+                    cv2.rectangle(frame_roi, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    fallback_debug = {
+                        "label": f"{cfg['label']}-fallback",
+                        "roi_rect": (x1, y1, x2, y2),
+                        "frame_roi": frame_roi,
+                        "steps": steps,
+                    }
                 continue
 
             abs_xs = contour_px[:, 0] + origin_xy[0]
@@ -557,5 +656,113 @@ class MatCalibrator:
             if best_front_x_cm is None or toe_cm[0] > best_front_x_cm:
                 best_front_x_cm = toe_cm[0]
                 best_edge_vis = edge_vis
+                if return_steps:
+                    frame_roi = frame.copy()
+                    cv2.rectangle(frame_roi, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    best_debug = {
+                        "label": cfg["label"],
+                        "roi_rect": (x1, y1, x2, y2),
+                        "frame_roi": frame_roi,
+                        "steps": steps,
+                    }
 
+        if return_steps:
+            return best_front_x_cm, best_edge_vis, best_debug or fallback_debug
         return best_front_x_cm, best_edge_vis
+
+    # ──────── YOLO 实例分割（鞋底检测） ────────
+
+    _yolo_model = None
+
+    @classmethod
+    def _get_yolo_model(cls):
+        """懒加载 YOLOv8-seg 模型（YOLOv10 无官方 seg 权重，用 v8-seg 替代）。"""
+        if cls._yolo_model is None:
+            from ultralytics import YOLO
+            cls._yolo_model = YOLO("yolov8n-seg.pt", verbose=False)
+        return cls._yolo_model
+
+    def detect_shoe_yolo_seg(self, roi_bgr, roi_origin_xy, return_steps=False):
+        """用 YOLOv10-seg 在 ROI 内做实例分割，提取鞋子后跟 X。
+
+        步骤：
+          1. YOLO seg 推理 → 获取 masks
+          2. 筛选 ROI 底部区域内的 mask（鞋子贴地）
+          3. 取 X 最小的 mask 像素点 → 后跟坐标
+          4. 换算到垫子坐标系
+
+        返回: (landing_x_cm, edge_vis, [steps_dict]) 或 (None, None, None)
+        """
+        steps = {} if return_steps else None
+        try:
+            model = self._get_yolo_model()
+            results = model(roi_bgr, verbose=False, conf=0.3, iou=0.5)
+        except Exception as e:
+            if return_steps:
+                steps["error"] = str(e)
+                fallback = self._make_fallback_vis(roi_bgr, roi_origin_xy)
+                return None, fallback, steps
+            return None, None
+
+        if steps is not None:
+            steps["frame_roi"] = roi_bgr.copy()
+
+        h, w = roi_bgr.shape[:2]
+        best_heel_x_cm = None
+        best_vis = None
+        total_masks = 0
+        passed_bottom = 0
+
+        for r in results:
+            if r.masks is None:
+                continue
+            for seg_idx in range(len(r.masks)):
+                total_masks += 1
+                mask = r.masks.data[seg_idx].cpu().numpy()
+                mask_h, mask_w = mask.shape
+                if mask_h != h or mask_w != w:
+                    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                mask_bin = (mask > 0.5).astype(np.uint8) * 255
+
+                ys, xs = np.where(mask_bin > 0)
+                if len(ys) == 0:
+                    continue
+                if float(np.max(ys)) < h - 10:
+                    continue
+                passed_bottom += 1
+
+                min_x_idx = np.argmin(xs)
+                heel_roi_x = float(xs[min_x_idx])
+                heel_roi_y = float(ys[min_x_idx])
+
+                heel_px = (heel_roi_x + roi_origin_xy[0], heel_roi_y + roi_origin_xy[1])
+                heel_cm = self.transform_to_mat_cm(heel_px)
+                if heel_cm is None or heel_cm[0] < 0 or heel_cm[0] > 350:
+                    continue
+
+                if best_heel_x_cm is None or heel_cm[0] < best_heel_x_cm:
+                    best_heel_x_cm = heel_cm[0]
+                    vis = roi_bgr.copy()
+                    overlay = np.zeros_like(vis)
+                    overlay[mask_bin > 0] = (0, 255, 0)
+                    vis = cv2.addWeighted(vis, 0.6, overlay, 0.4, 0)
+                    cv2.circle(vis, (int(heel_roi_x), int(heel_roi_y)), 5, (0, 0, 255), -1)
+                    cls_id = int(r.boxes.data[seg_idx][5]) if r.boxes is not None else -1
+                    conf = float(r.boxes.data[seg_idx][4]) if r.boxes is not None else 0.0
+                    cls_name = r.names.get(cls_id, f"cls{cls_id}") if r.names else f"cls{cls_id}"
+                    cv2.putText(vis, f"{cls_name} {conf:.2f}", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    best_vis = vis
+
+        if return_steps:
+            if best_vis is not None:
+                steps["edge_vis"] = best_vis
+            steps["yolo_masks"] = total_masks
+            steps["yolo_bottom"] = passed_bottom
+            return best_heel_x_cm, best_vis, steps
+        return best_heel_x_cm, best_vis
+
+    def _make_fallback_vis(self, roi_bgr, roi_origin_xy):
+        fallback = roi_bgr.copy()
+        cv2.rectangle(fallback, (0, 0), (roi_bgr.shape[1] - 1, roi_bgr.shape[0] - 1), (0, 255, 255), 2)
+        cv2.putText(fallback, "YOLO FAILED", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        return fallback
