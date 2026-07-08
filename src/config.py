@@ -26,7 +26,6 @@ class JumpConfig:
     enable_foul_detection: bool = True
     landing_offset_cm: float = -4.0  # 落地点修正（鞋跟厚度补偿）
     detection_method: str = "contour"  # 检测方式: "contour"(差分) / "skeleton"(骨骼关键点)
-    shoe_detection: str = "canny"      # 鞋底检测: "canny"(边缘检测) / "yolo"(YOLO实例分割)
 
 
 def resolve_video_source(value):
