@@ -64,6 +64,10 @@ class StandingLongJumpSystem:
 
         self._log("INIT", f"系统初始化完成, video_source={config.video_source}")
 
+        # ── 检测方式 ──
+        self._detection_method = config.detection_method  # "contour" or "skeleton"
+        self._log("INIT", f"检测方式: {'差分(contour)' if self._detection_method == 'contour' else '骨骼关键点(skeleton)'}")
+
         # --- 状态变量 ---
         self.state = "IDLE"
         self.takeoff_pt_px = None
@@ -76,15 +80,33 @@ class StandingLongJumpSystem:
         self.takeoff_frame = None
         self.landing_frame = None
 
-        # ── 轮廓法状态变量（替代骨架关键点） ──
-        self._person_area_baseline = None      # READY 状态下的人体轮廓面积基线
-        self._front_x_baseline = None          # READY 状态下的人体前缘 X 基线
-        self._front_x_cm_hist = deque(maxlen=30)  # 前缘 X 历史，用于平滑取起跳点
-        self._ready_stable_frames = 0          # READY 稳定帧数累计
-        self._ready_missing_frames = 0         # 人体消失连续帧数（起跳判定）
-        self._jump_frame_counter = 0           # JUMPING 状态帧计数器
-        self._takeoff_recorded_x = None        # 记录的起跳 X(cm)
-        self._last_kpts = None                 # 上一帧骨架数据（用于犯规检测）
+        # ── 轮廓法（差分）状态变量 ──
+        self._person_area_baseline = None
+        self._front_x_baseline = None
+        self._front_x_cm_hist = deque(maxlen=30)
+        self._ready_stable_frames = 0
+        self._ready_missing_frames = 0
+        self._jump_frame_counter = 0
+        self._takeoff_recorded_x = None
+        self._landing_stable_counter = 0
+        self._landing_stable_counter = 0  # ROI 鞋子落地连续确认帧数
+
+        # ── 骨骼关键点法状态变量 ──
+        self._skeleton_baseline_x_cm = None
+        self._skeleton_baseline_hip_x = None
+        self._skeleton_baseline_ankle_y = None
+        self._skeleton_jump_trigger_counter = 0
+        self._skeleton_ready_stable = 0
+        self._skeleton_front_toe_hist = deque(maxlen=30)
+        self._skeleton_toe_y_px_hist = deque(maxlen=12)
+        self._skeleton_toe_missing_counter = 0
+        self._skeleton_jump_counter = 0
+        self._skeleton_foot_hist = {
+            "l": {"y_px": deque(maxlen=3), "x_cm": deque(maxlen=3), "y_cm": deque(maxlen=3), "xy_px": deque(maxlen=3)},
+            "r": {"y_px": deque(maxlen=3), "x_cm": deque(maxlen=3), "y_cm": deque(maxlen=3), "xy_px": deque(maxlen=3)},
+        }
+
+        self._last_kpts = None  # 上一帧骨架数据（用于犯规检测）
         self._takeoff_frame_img = None
         self._landing_frame_img = None
         self._prev_frame_img = None
@@ -161,6 +183,7 @@ class StandingLongJumpSystem:
         return None, None
 
     def _reset_round_state(self):
+        # 轮廓法变量
         self._person_area_baseline = None
         self._front_x_baseline = None
         self._front_x_cm_hist.clear()
@@ -168,6 +191,21 @@ class StandingLongJumpSystem:
         self._ready_missing_frames = 0
         self._jump_frame_counter = 0
         self._takeoff_recorded_x = None
+        self._landing_stable_counter = 0
+        # 骨架法变量
+        self._skeleton_baseline_x_cm = None
+        self._skeleton_baseline_hip_x = None
+        self._skeleton_baseline_ankle_y = None
+        self._skeleton_jump_trigger_counter = 0
+        self._skeleton_ready_stable = 0
+        self._skeleton_front_toe_hist.clear()
+        self._skeleton_toe_y_px_hist.clear()
+        self._skeleton_toe_missing_counter = 0
+        self._skeleton_jump_counter = 0
+        for side in ["l", "r"]:
+            for q in self._skeleton_foot_hist[side].values():
+                q.clear()
+        # 公共变量
         self.takeoff_x_cm = None
         self.takeoff_pt_px = None
         self.landing_x_cm = None
@@ -267,6 +305,7 @@ class StandingLongJumpSystem:
         self.state = "READY"
         self._log("STATE", "IDLE -> READY")
         self._reset_round_state()
+        self._prev_frame_img = frame.copy()
         area = self.calibrator.get_person_area_px(frame)
         front_x = self.calibrator.get_person_front_x_cm(frame)
         self._person_area_baseline = area if area > 500 else 2000.0
@@ -289,6 +328,15 @@ class StandingLongJumpSystem:
             self._ready_stable_frames = 0
             return
 
+        # ROI 鞋子前缘检测（当有骨架关键点时更精确）
+        if self._last_kpts is not None:
+            roi_front_x, _ = self.calibrator.detect_shoe_front_x_cm(frame, self._last_kpts)
+            if roi_front_x is not None and 0 < roi_front_x < 350:
+                self._front_x_cm_hist.append(roi_front_x)
+        # 后备：无骨架时用轮廓法
+        elif front_x is not None and 0 < front_x < 350:
+            self._front_x_cm_hist.append(front_x)
+
         # 当前面积相对于基线的比例
         area_ratio = area / max(self._person_area_baseline, 1.0)
 
@@ -298,10 +346,6 @@ class StandingLongJumpSystem:
             self._person_area_baseline = 0.95 * self._person_area_baseline + 0.05 * area
             self._ready_stable_frames += 1
             self._ready_missing_frames = 0
-
-            # 收集前缘 X（用于起跳点记录）
-            if front_x is not None and 0 < front_x < 350:
-                self._front_x_cm_hist.append(front_x)
 
             # 每10帧 Debug
             if frame_idx % 10 == 0:
@@ -340,6 +384,7 @@ class StandingLongJumpSystem:
 
             self._log("JUMP", f"起跳成功！稳定期={self._ready_stable_frames}帧, "
                               f"起跳点={takeoff_x:.1f}cm (前缘均值, N={len(self._front_x_cm_hist)})")
+            self._save_diff_image("takeoff", self._prev_frame_img if self._prev_frame_img is not None else frame)
 
             # 犯规检测（依赖骨架关键点）
             if self.foul_detector.enabled and self._last_kpts is not None:
@@ -359,47 +404,55 @@ class StandingLongJumpSystem:
             self.takeoff_pt_xy = None
             self._takeoff_frame_img = frame.copy()
 
-    def _handle_jumping(self, frame_idx, frame):
+    def _handle_jumping(self, frame_idx, frame, kpts):
         self._jump_frame_counter += 1
-        area = self.calibrator.get_person_area_px(frame)
-        back_x = self.calibrator.get_person_back_x_cm(frame)
 
-        # ── 落地检测 ──
+        # ── 落地检测：优先用 ROI 鞋子边缘检测（需要骨架关键点） ──
         detected_landing = False
+        landing_x_from_shoe = None
+        edge_vis = None
+
         if self._jump_frame_counter >= self.config.min_flight_frames:
-            # 轮廓面积 > 阈值 = 人体重新出现在垫上 = 落地
-            if area > 2000:
-                detected_landing = True
+            if kpts is not None:
+                shoe_x, edge_vis = self.calibrator.get_shoe_landing_x_cm(frame, kpts)
+                if shoe_x is not None and 0 < shoe_x < 350:
+                    self._landing_stable_counter += 1
+                    landing_x_from_shoe = shoe_x
+                    # 需要连续 N 帧确认才算落地（防止空中帧误判）
+                    if self._landing_stable_counter >= 3:
+                        detected_landing = True
+                        self._log("LAND", f"ROI 鞋子检测到落地, x={shoe_x:.1f}cm, 已连续{self._landing_stable_counter}帧确认")
+                else:
+                    self._landing_stable_counter = max(0, self._landing_stable_counter - 1)
+            else:
+                self._landing_stable_counter = max(0, self._landing_stable_counter - 1)
 
         # 超时强制落地
         if not detected_landing and self._jump_frame_counter >= self.config.max_jump_frames:
             detected_landing = True
             self._log("LAND", f"落地超时({self.config.max_jump_frames}帧)，强制落地")
 
+        # 保存调试图（有鞋边缘检测结果时）
+        if edge_vis is not None and self.images_dir and self._jump_frame_counter % 5 == 0:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:21]
+            imwrite_safe(os.path.join(self.images_dir, f"shoe-edge-f{frame_idx}-{ts}.jpeg"), edge_vis)
+
         if not detected_landing:
             return
 
         # ── 确定落地位置 ──
         landing_x = None
-        used_back = False
-        if back_x is not None and 0 < back_x < 350:
-            landing_x = back_x
-            used_back = True
+        if landing_x_from_shoe is not None and 0 < landing_x_from_shoe < 350:
+            landing_x = landing_x_from_shoe
         else:
-            # 后备：用轮廓底部 Y 处的 X
-            bottom_x = self.calibrator.get_person_bottom_x_cm(frame)
-            if bottom_x is not None and 0 < bottom_x < 350:
-                landing_x = bottom_x
+            # 后备：用垫子轮廓法
+            back_x = self.calibrator.get_person_back_x_cm(frame)
+            if back_x is not None and 0 < back_x < 350:
+                landing_x = back_x
             else:
-                # 用轮廓重心 X
-                centroid_x = self.calibrator.get_person_centroid_x_cm(frame)
-                if centroid_x is not None and 0 < centroid_x < 350:
-                    landing_x = centroid_x
-
-        if landing_x is None:
-            self._log("LAND", "无法获取落地位置，忽略")
-            self.state = "READY"
-            return
+                self._log("LAND", "无法获取落地位置，忽略")
+                self.state = "READY"
+                return
 
         # ── 计算距离 ──
         temp_dist = landing_x - (self.takeoff_x_cm if self.takeoff_x_cm else 0.0) + self.landing_offset_cm
@@ -411,8 +464,9 @@ class StandingLongJumpSystem:
             self._enter_ready_state(frame)
             return
 
-        method = "back_x" if used_back else "bottom_x/centroid"
+        method = "ROI_shoe" if landing_x_from_shoe is not None else "backup_contour"
         self._log("LAND", f"落地触发({method}), landing_x={landing_x:.1f}, 距离={temp_dist:.1f}cm")
+        self._save_diff_image("landing", frame)
         self.state = "LANDED"
         self.landing_frame = frame_idx
         self.landing_pt_px = None
@@ -421,6 +475,189 @@ class StandingLongJumpSystem:
         self.final_distance_cm = max(0.0, temp_dist)
         if self.config.debug_dir:
             self._landing_frame_img = frame.copy()
+
+    # ═══════════════════════════════════════════════
+    # 骨骼关键点法处理函数（仅 _detection_method == "skeleton" 时使用）
+    # ═══════════════════════════════════════════════
+
+    def _save_diff_image(self, tag, frame):
+        """保存当前帧的垫子差分热力图到 images 目录。"""
+        if not self.images_dir:
+            return
+        diff_img = self.calibrator.render_diff_image(frame)
+        if diff_img is not None:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            filename = os.path.join(self.images_dir, f"diff-{tag}-{ts}.jpeg")
+            imwrite_safe(filename, diff_img)
+            self._log("DIFF", f"差分图已保存: {filename}")
+
+    @staticmethod
+    def _skeleton_detect_contact(hist):
+        """脚后跟 Y 轴触地检测（骨架法）。"""
+        if len(hist["y_px"]) < 3 or len(hist["x_cm"]) < 3:
+            return None, None
+        y0, y1, y2 = list(hist["y_px"])
+        x1 = list(hist["x_cm"])[1]
+        if (y1 >= y0) and (y1 >= y2) and x1 > 20.0:
+            xy_mid = list(hist["xy_px"])[1] if len(hist["xy_px"]) == 3 else None
+            return x1, xy_mid
+        return None, None
+
+    def _skeleton_enter_ready(self, ankle_cm, front_toe_cm):
+        self.state = "READY"
+        self._log("STATE", "IDLE -> READY")
+        self._reset_round_state()
+        self._skeleton_baseline_x_cm = front_toe_cm[0] if front_toe_cm is not None and self.calibrator.in_mat(front_toe_cm) else ankle_cm[0]
+        self._log("READY", f"骨架法基线X={self._skeleton_baseline_x_cm:.1f}cm")
+
+    def _handle_idle_skeleton(self, ankle_cm, front_toe_cm):
+        self.foul_detector.reset()
+        if ankle_cm is not None and self.calibrator.in_mat(ankle_cm):
+            self._log("IDLE", f"检测到人体在垫内(骨架), ankle=({ankle_cm[0]:.1f},{ankle_cm[1]:.1f})cm")
+            self._skeleton_enter_ready(ankle_cm, front_toe_cm)
+
+    def _handle_ready_skeleton(self, frame_idx, kpts, ankle_cm, ankle_xy, front_toe_cm, front_toe_xy, toe_xy, takeoff_signal):
+        hip_l = self._get_kpt(kpts, self.kpt_idx["l_hip"])
+        hip_r = self._get_kpt(kpts, self.kpt_idx["r_hip"])
+        hip_xy = self._avg_points({"l": hip_l, "r": hip_r})
+        hip_cm = self.calibrator.transform_to_mat_cm(hip_xy) if hip_xy else None
+        curr_ankle_y_px = ankle_xy[1] if ankle_xy else 99999
+
+        if ankle_cm is None:
+            return
+
+        cur_x = front_toe_cm[0] if front_toe_cm is not None and self.calibrator.in_mat(front_toe_cm) else ankle_cm[0]
+        if self._skeleton_baseline_x_cm is None:
+            self._skeleton_baseline_x_cm = cur_x
+        if self._skeleton_baseline_hip_x is None and hip_cm:
+            self._skeleton_baseline_hip_x = hip_cm[0]
+        if self._skeleton_baseline_ankle_y is None:
+            self._skeleton_baseline_ankle_y = curr_ankle_y_px
+
+        toe_moved = cur_x - self._skeleton_baseline_x_cm
+        if abs(toe_moved) < 6.0:
+            self._skeleton_baseline_x_cm = (0.9 * self._skeleton_baseline_x_cm) + (0.1 * cur_x)
+            if hip_cm and self._skeleton_baseline_hip_x:
+                self._skeleton_baseline_hip_x = (0.9 * self._skeleton_baseline_hip_x) + (0.1 * hip_cm[0])
+            if self._skeleton_baseline_ankle_y:
+                self._skeleton_baseline_ankle_y = (0.9 * self._skeleton_baseline_ankle_y) + (0.1 * curr_ankle_y_px)
+            self._skeleton_ready_stable += 1
+        else:
+            if not (self._skeleton_ready_stable >= 10 and toe_moved > 0):
+                self._skeleton_ready_stable = 0
+                self._skeleton_baseline_x_cm = cur_x
+                if hip_cm:
+                    self._skeleton_baseline_hip_x = hip_cm[0]
+                self._skeleton_baseline_ankle_y = curr_ankle_y_px
+                toe_moved = 0
+
+        if frame_idx % 10 == 0:
+            print(f"[SKEL DEBUG] 帧{frame_idx}: baseline={self._skeleton_baseline_x_cm:.1f}, cur={cur_x:.1f}, "
+                  f"toe_moved={toe_moved:.1f}cm, stable={self._skeleton_ready_stable}")
+
+        hip_moved = (hip_cm[0] - self._skeleton_baseline_hip_x) if (hip_cm and self._skeleton_baseline_hip_x) else 0
+        ankle_lifted = (self._skeleton_baseline_ankle_y - curr_ankle_y_px) > 15.0 if self._skeleton_baseline_ankle_y else False
+
+        is_taking_off = False
+        if self._skeleton_toe_missing_counter >= 3 and toe_moved > -3.0:
+            is_taking_off = True
+        if toe_moved > self.config.trigger_move_cm:
+            is_taking_off = True
+        elif hip_moved > 15.0 and toe_moved > 3.0:
+            is_taking_off = True
+        elif ankle_lifted and toe_moved > 3.0:
+            is_taking_off = True
+
+        self._skeleton_jump_trigger_counter = (self._skeleton_jump_trigger_counter + 1 if is_taking_off else 0) if self._skeleton_ready_stable >= 10 else 0
+
+        if not takeoff_signal and front_toe_cm is not None and front_toe_xy is not None and self.calibrator.in_mat(front_toe_cm):
+            self._skeleton_front_toe_hist.append((float(front_toe_cm[0]), float(front_toe_cm[1]), float(front_toe_xy[0]), float(front_toe_xy[1])))
+
+        if self._skeleton_jump_trigger_counter < self.config.trigger_frames:
+            return
+
+        takeoff_x = self._skeleton_baseline_x_cm
+        self._log("JUMP", f"起跳成功(骨架)！稳定期={self._skeleton_ready_stable}帧, 起跳点={takeoff_x:.1f}cm")
+
+        self.foul_detector.check_step_jump(self._skeleton_front_toe_hist, self._skeleton_baseline_x_cm)
+        self.foul_detector.check_single_leg_takeoff(kpts)
+        self.foul_detector.check_line_violation(takeoff_x, self.config.takeoff_line_cm)
+        self.foul_detector.check_prop_assistance(kpts)
+        if self.foul_detector.reason:
+            self._log("FOUL", f"起跳时检测到犯规: {self.foul_detector.reason}")
+
+        self._save_diff_image("takeoff", self._prev_frame_img if self._prev_frame_img is not None else self._takeoff_frame_img)
+        self.state = "JUMPING"
+        self._log("STATE", "READY -> JUMPING")
+        self._skeleton_jump_counter = 0
+        self.takeoff_frame = frame_idx
+        self.takeoff_pt_px = front_toe_xy if front_toe_xy is not None else (toe_xy if toe_xy else ankle_xy)
+        self.takeoff_pt_xy = self.takeoff_pt_px
+        self.takeoff_x_cm = takeoff_x + self.takeoff_display_offset_cm
+        self._takeoff_frame_img = self._prev_frame_img.copy() if self._prev_frame_img is not None else None
+
+    def _handle_jumping_skeleton(self, frame_idx, heel_l_xy, heel_r_xy, heel_l_cm, heel_r_cm):
+        self._skeleton_jump_counter += 1
+        if heel_l_xy is not None or heel_r_xy is not None:
+            for side, heel_xy, heel_cm in [("l", heel_l_xy, heel_l_cm), ("r", heel_r_xy, heel_r_cm)]:
+                if heel_xy is None or heel_cm is None:
+                    continue
+                self._skeleton_foot_hist[side]["y_px"].append(heel_xy[1])
+                self._skeleton_foot_hist[side]["x_cm"].append(heel_cm[0] - (self.takeoff_x_cm or 0.0))
+                self._skeleton_foot_hist[side]["y_cm"].append(heel_cm[1])
+                self._skeleton_foot_hist[side]["xy_px"].append((float(heel_xy[0]), float(heel_xy[1])))
+
+        detected_landing = False
+        landing_xy_candidate = None
+
+        if self._skeleton_jump_counter >= self.config.min_flight_frames:
+            contact_l, contact_l_xy = self._skeleton_detect_contact(self._skeleton_foot_hist["l"])
+            contact_r, contact_r_xy = self._skeleton_detect_contact(self._skeleton_foot_hist["r"])
+            if contact_l is not None or contact_r is not None:
+                detected_landing = True
+                if contact_l is not None and contact_r is not None:
+                    landing_xy_candidate = contact_l_xy if contact_l <= contact_r else contact_r_xy
+                else:
+                    landing_xy_candidate = contact_l_xy if contact_l is not None else contact_r_xy
+
+        if not detected_landing and self._skeleton_jump_counter >= self.config.max_jump_frames:
+            detected_landing = True
+
+        if not detected_landing:
+            return
+
+        landing_x_for_dist = None
+        if landing_xy_candidate is not None:
+            temp_cm_pt = self.calibrator.transform_to_mat_cm(landing_xy_candidate)
+            if temp_cm_pt is not None and 0 < temp_cm_pt[0] < 340:
+                landing_x_for_dist = temp_cm_pt[0]
+
+        if landing_x_for_dist is None:
+            self._log("LAND", "无法获取骨架落地位置，忽略")
+            self.state = "READY"
+            return
+
+        temp_dist = landing_x_for_dist - (self.takeoff_x_cm if self.takeoff_x_cm else 0.0) + self.landing_offset_cm
+
+        if temp_dist < 50.0:
+            self._log("LAND", f"忽略假动作(骨架, 距离{temp_dist:.1f}cm 过短)，重置为 READY")
+            self.state = "READY"
+            self._skeleton_jump_trigger_counter = 0
+            self._skeleton_ready_stable = 0
+            self._skeleton_jump_counter = 0
+            return
+
+        self.state = "LANDED"
+        self._log("LAND", f"落地触发(骨架), landing_x={landing_x_for_dist:.1f}, 距离={temp_dist:.1f}cm")
+        if self._prev_frame_img is not None:
+            self._save_diff_image("landing", self._prev_frame_img)
+        self.landing_frame = frame_idx
+        self.landing_pt_px = landing_xy_candidate
+        self.landing_pt_xy = self.landing_pt_px
+        self.landing_x_cm = landing_x_for_dist
+        self.final_distance_cm = max(0.0, temp_dist)
+        if self.config.debug_dir:
+            self._landing_frame_img = None
 
     # ---------- 结果保存 ----------
     def _save_landed_image(self, frame, kpts):
@@ -552,6 +789,9 @@ class StandingLongJumpSystem:
                     if not self.calibrator.mat_locked:
                         self.calibrator.mat_locked = True
                         self._log("CALIB", "垫子标定完成")
+                        # 记录基线帧（干净垫子参考）
+                        self.calibrator.set_baseline_frame(frame)
+                        self._log("CALIB", "基线帧已保存")
                         # 保存两张垫子识别图
                         if self.images_dir:
                             mask_quad = self.calibrator.render_mask(frame)
@@ -566,15 +806,67 @@ class StandingLongJumpSystem:
                 if kpts is not None:
                     self._last_kpts = kpts
 
-                # ── 状态机：完全基于轮廓检测，不依赖骨架关键点 ──
+                # ── 状态机：按检测方式分支 ──
                 if self.calibrator.calibrated:
-                    if self.state == "IDLE":
-                        self._handle_idle(frame)
-                    elif self.state == "READY":
-                        self._handle_ready(frame_idx, frame)
+                    if self._detection_method == "contour":
+                        # 差分法：完全基于轮廓检测
+                        if self.state == "IDLE":
+                            self._handle_idle(frame)
+                        elif self.state == "READY":
+                            self._handle_ready(frame_idx, frame)
+                    else:
+                        # 骨架法：需要关键点数据
+                        if kpts is not None and self.state in ("IDLE", "READY"):
+                            ankles = self._get_feet(kpts, "ankle")
+                            ankle_xy = self._avg_points(ankles)
+                            ankle_cm = self.calibrator.transform_to_mat_cm(ankle_xy)
+
+                            toes = self._get_feet(kpts, "toe")
+                            toe_l_xy = toes.get("l")
+                            toe_r_xy = toes.get("r")
+                            toe_l_cm = self.calibrator.transform_to_mat_cm(toe_l_xy) if toe_l_xy else None
+                            toe_r_cm = self.calibrator.transform_to_mat_cm(toe_r_xy) if toe_r_xy else None
+                            toe_xy = self._avg_points(toes)
+                            front_toe_xy, front_toe_cm = self._front_toe(toe_l_xy, toe_r_xy, toe_l_cm, toe_r_cm)
+
+                            toe_y_px = None
+                            if front_toe_xy is not None:
+                                toe_y_px = float(front_toe_xy[1])
+                            elif toe_xy is not None:
+                                toe_y_px = float(toe_xy[1])
+
+                            if toe_y_px is None:
+                                self._skeleton_toe_missing_counter += 1
+                            else:
+                                self._skeleton_toe_missing_counter = 0
+                                self._skeleton_toe_y_px_hist.append(toe_y_px)
+
+                            ground_toe_y_px = max(self._skeleton_toe_y_px_hist) if self._skeleton_toe_y_px_hist else None
+                            toe_lifted = False
+                            if toe_y_px is not None and ground_toe_y_px is not None:
+                                toe_lifted = (ground_toe_y_px - toe_y_px) > 8.0
+                            takeoff_signal = toe_lifted or (self._skeleton_toe_missing_counter >= 2)
+
+                            if self.state == "IDLE":
+                                self._handle_idle_skeleton(ankle_cm, front_toe_cm)
+                            elif self.state == "READY":
+                                self._handle_ready_skeleton(frame_idx, kpts, ankle_cm, ankle_xy,
+                                                            front_toe_cm, front_toe_xy, toe_xy, takeoff_signal)
 
                 if self.state == "JUMPING":
-                    self._handle_jumping(frame_idx, frame)
+                    if self._detection_method == "contour":
+                        self._handle_jumping(frame_idx, frame, kpts)
+                    else:
+                        # 骨架法落地：需要脚后跟关键点
+                        if kpts is not None:
+                            heels = self._get_feet(kpts, "heel")
+                            heel_l_xy = heels.get("l")
+                            heel_r_xy = heels.get("r")
+                            heel_l_cm = self.calibrator.transform_to_mat_cm(heel_l_xy) if heel_l_xy else None
+                            heel_r_cm = self.calibrator.transform_to_mat_cm(heel_r_xy) if heel_r_xy else None
+                        else:
+                            heel_l_xy = heel_r_xy = heel_l_cm = heel_r_cm = None
+                        self._handle_jumping_skeleton(frame_idx, heel_l_xy, heel_r_xy, heel_l_cm, heel_r_cm)
 
                 if self.calibrator.calibrated:
                     self._recalc_results_with_current_mat()

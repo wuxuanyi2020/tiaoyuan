@@ -18,6 +18,7 @@ class MatCalibrator:
         self.jump_line_px = None
         self.mat_view_scale = 4.0
         self.px_per_cm = 0.0
+        self._baseline_frame = None  # 标定后的第一帧（干净垫子），用于差分
 
     def mouse_callback(self, event, x, y, flags, param):
         if not self.manual_mode or self.mat_locked:
@@ -211,6 +212,50 @@ class MatCalibrator:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         return mask
 
+    # ──────── 基线帧 & 差分图 ────────
+
+    def set_baseline_frame(self, frame):
+        """将标定后的第一帧保存为基线帧（干净垫子参考）。"""
+        self._baseline_frame = frame.copy()
+
+    def render_diff_image(self, frame, colormap=cv2.COLORMAP_JET):
+        """生成垫子区域差分热力图：frame 与基线帧的差异。
+
+        返回：
+          - 彩色热力图（BGR），垫子外区域保持原图
+          - 若基线帧未设置，返回 None
+        """
+        if self._baseline_frame is None or self._smooth_box is None:
+            return None
+
+        # 转灰度
+        cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        base_gray = cv2.cvtColor(self._baseline_frame, cv2.COLOR_BGR2GRAY)
+
+        # 垫子区域遮罩
+        box_mask = np.zeros_like(cur_gray)
+        cv2.fillPoly(box_mask, [self._smooth_box.astype(np.int32)], 255)
+
+        # 差异绝对值（仅垫子内）
+        diff = cv2.absdiff(cur_gray, base_gray)
+        diff = cv2.bitwise_and(diff, box_mask)
+
+        # 高斯模糊去噪
+        diff = cv2.GaussianBlur(diff, (5, 5), 0)
+
+        # 归一化 → 伪彩色热力图
+        diff_norm = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        heatmap = cv2.applyColorMap(diff_norm, colormap)
+
+        # 与原图叠加（仅垫子区域）
+        result = frame.copy()
+        heat_region = cv2.bitwise_and(heatmap, heatmap, mask=box_mask)
+        cv2.addWeighted(heat_region, 0.6, result, 0.4, 0, result)
+
+        # 绘制垫子轮廓
+        cv2.polylines(result, [self._smooth_box.astype(np.int32)], True, (255, 255, 255), 2)
+        return result
+
     # ──────── 人体轮廓检测（替代骨架关键点） ────────
 
     def get_person_mask(self, frame, morphology_close=True):
@@ -306,3 +351,211 @@ class MatCalibrator:
         max_y_idx = np.argmax(ys)
         cm = self.transform_to_mat_cm((float(xs[max_y_idx]), float(ys[max_y_idx])))
         return cm[0] if cm is not None else None
+
+    # ──────── ROI 鞋子边缘检测（基于 MediaPipe 关键点） ────────
+
+    def _foot_roi(self, frame, kpts, foot_indices, expand=1.5):
+        """根据关键点列表计算脚部 ROI 矩形。
+
+        参数:
+            frame: 原图 (BGR)
+            kpts: MediaPipe 关键点 (NormalizedLandmarkList)
+            foot_indices: 关键点索引列表，如 [27, 29, 31] (左踝+脚跟+脚趾)
+            expand: ROI 扩大倍数
+
+        返回:
+            (roi_gray, roi_origin_xy, roi_w, roi_h)
+            - roi_gray: 裁剪出的 ROI 灰度图
+            - roi_origin_xy: ROI 在原图的左上角 (x, y)
+            - roi_w, roi_h: ROI 宽高
+            - None 如果关键点缺失
+        """
+        pts_px = []
+        for idx in foot_indices:
+            kpt = self._get_kpt(kpts, idx)
+            if kpt is None:
+                continue
+            pts_px.append((int(kpt[0]), int(kpt[1])))
+        if len(pts_px) < 3:
+            return None
+
+        h, w = frame.shape[:2]
+        xs = [p[0] for p in pts_px]
+        ys = [p[1] for p in pts_px]
+        cx, cy = float(np.mean(xs)), float(np.mean(ys))
+        half_w = max((max(xs) - min(xs)) * expand, 40.0)
+        half_h = max((max(ys) - min(ys)) * expand, 40.0)
+
+        x1 = max(0, int(cx - half_w))
+        y1 = max(0, int(cy - half_h * 0.6))  # 向上多留（脚踝以上）
+        x2 = min(w, int(cx + half_w))
+        y2 = min(h, int(cy + half_h * 1.4))  # 向下多留（脚底）
+
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        return roi_gray, (x1, y1), x2 - x1, y2 - y1
+
+    @staticmethod
+    def _get_kpt(kpts, idx):
+        """从 (33,2) numpy 数组中安全提取单关键点。
+
+        返回 (x, y) 像素坐标，或 None。
+        """
+        if kpts is None or idx < 0 or idx >= len(kpts):
+            return None
+        x, y = float(kpts[idx][0]), float(kpts[idx][1])
+        if x == 0.0 and y == 0.0:
+            return None
+        return (x, y)
+
+    def detect_shoe_contour_px(self, roi_gray, roi_h=None):
+        """对 ROI 灰度图做 Canny 边缘检测 + 轮廓筛选，返回鞋子轮廓像素点列表。
+
+        步骤：
+          1. 高斯模糊去噪
+          2. 自适应二值化（分离鞋底/垫面）
+          3. Canny 边缘检测
+          4. 形态学闭运算补全边缘缺口
+          5. 筛选面积最大闭合轮廓
+          6. 若 roi_h 提供，只保留底部贴地（轮廓底部接近 ROI 底部）的轮廓
+
+        返回:
+            (contour_pixels, edge_img) — contour_pixels 是 (N,2) 的像素坐标数组（相对 ROI），
+            edge_img 是可视化边缘图（调试用）。找不到返回 (None, None)。
+        """
+        # 高斯模糊
+        blurred = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+
+        # 自适应二值化
+        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 31, 5)
+
+        # Canny 边缘
+        edges = cv2.Canny(binary, 30, 100)
+
+        # 形态学闭运算补缺口
+        kernel = np.ones((5, 5), np.uint8)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # 找轮廓，选最大
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, None
+
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if area < 100:  # 太小的轮廓不是鞋
+            return None, None
+
+        # 落地过滤：轮廓底部必须接近 ROI 底部（鞋子贴地）
+        if roi_h is not None:
+            max_y = max(p[0][1] for p in largest)  # 轮廓底部 Y（ROI 相对坐标）
+            if max_y < roi_h - 10:  # 底部距离 ROI 底边超过10px → 在空中，非落地
+                return None, None
+
+        # 提取轮廓所有像素
+        contour_mask = np.zeros_like(edges)
+        cv2.drawContours(contour_mask, [largest], -1, 255, -1)
+        ys, xs = np.where(contour_mask > 0)
+        if len(xs) == 0:
+            return None, None
+        pixels = np.column_stack((xs, ys))
+
+        # 可视化边缘图
+        edge_vis = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(edge_vis, [largest], -1, (0, 255, 0), 2)
+        # 标注后跟点（X 最小点）
+        min_x_idx = np.argmin(xs)
+        cv2.circle(edge_vis, (int(xs[min_x_idx]), int(ys[min_x_idx])), 4, (0, 0, 255), -1)
+
+        return pixels, edge_vis
+
+    def get_shoe_landing_x_cm(self, frame, kpts):
+        """基于 ROI 鞋子边缘检测的落地位置。
+
+        取脚后跟轮廓中 X 最小的点（最靠近起跳线），换算到垫子坐标系。
+
+        返回:
+            (landing_x_cm, edge_vis) 或 (None, None)
+            edge_vis 是 ROI 可视化边缘图（用于 debug 保存）
+        """
+        # 左右脚关键点索引
+        foot_configs = [
+            {"label": "left", "indices": [27, 29, 31]},   # 左踝+脚跟+脚趾
+            {"label": "right", "indices": [28, 30, 32]},  # 右踝+脚跟+脚趾
+        ]
+
+        best_heel_x_cm = None
+        best_edge_vis = None
+
+        for cfg in foot_configs:
+            roi_result = self._foot_roi(frame, kpts, cfg["indices"], expand=1.5)
+            if roi_result is None:
+                continue
+            roi_gray, origin_xy, roi_w, roi_h = roi_result
+            contour_px, edge_vis = self.detect_shoe_contour_px(roi_gray, roi_h)
+            if contour_px is None or edge_vis is None:
+                continue
+
+            # 把 ROI 相对坐标 → 原图绝对坐标
+            abs_xs = contour_px[:, 0] + origin_xy[0]
+            abs_ys = contour_px[:, 1] + origin_xy[1]
+
+            # 取 X 最小的点（后跟最后沿 ≈ 最靠近起跳线）
+            min_idx = np.argmin(contour_px[:, 0])  # 在 ROI 内 X 最小的点
+            heel_px = (float(abs_xs[min_idx]), float(abs_ys[min_idx]))
+
+            # 换算垫子坐标
+            heel_cm = self.transform_to_mat_cm(heel_px)
+            if heel_cm is None or heel_cm[0] < 0 or heel_cm[0] > 350:
+                continue
+
+            if best_heel_x_cm is None or heel_cm[0] < best_heel_x_cm:
+                best_heel_x_cm = heel_cm[0]
+                best_edge_vis = edge_vis
+
+        return best_heel_x_cm, best_edge_vis
+
+    def detect_shoe_front_x_cm(self, frame, kpts):
+        """基于 ROI 鞋子边缘检测的起跳点位置。
+
+        取脚尖轮廓中 X 最大的点（离起跳线最远），换算到垫子坐标系。
+
+        返回:
+            (front_x_cm, edge_vis) 或 (None, None)
+        """
+        foot_configs = [
+            {"label": "left", "indices": [27, 29, 31]},
+            {"label": "right", "indices": [28, 30, 32]},
+        ]
+
+        best_front_x_cm = None
+        best_edge_vis = None
+
+        for cfg in foot_configs:
+            roi_result = self._foot_roi(frame, kpts, cfg["indices"], expand=1.5)
+            if roi_result is None:
+                continue
+            roi_gray, origin_xy, roi_w, roi_h = roi_result
+            contour_px, edge_vis = self.detect_shoe_contour_px(roi_gray, roi_h)
+            if contour_px is None or edge_vis is None:
+                continue
+
+            abs_xs = contour_px[:, 0] + origin_xy[0]
+            abs_ys = contour_px[:, 1] + origin_xy[1]
+
+            # 取 X 最大的点（脚尖最前沿）
+            max_idx = np.argmax(contour_px[:, 0])
+            toe_px = (float(abs_xs[max_idx]), float(abs_ys[max_idx]))
+
+            toe_cm = self.transform_to_mat_cm(toe_px)
+            if toe_cm is None or toe_cm[0] < 0 or toe_cm[0] > 350:
+                continue
+
+            if best_front_x_cm is None or toe_cm[0] > best_front_x_cm:
+                best_front_x_cm = toe_cm[0]
+                best_edge_vis = edge_vis
+
+        return best_front_x_cm, best_edge_vis
