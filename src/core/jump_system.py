@@ -10,6 +10,8 @@ import numpy as np
 from src.config import JumpConfig
 from src.rules.foul_detection import FoulDetector
 from src.inference.mat_calibration import MatCalibrator
+from src.inference.contour_detector import ContourDetector
+from src.inference.shoe_detector import ShoeEdgeDetector
 from src.inference.pose_estimator import PoseEstimator
 from src.visualization.rendering import Renderer, imwrite_safe
 
@@ -23,6 +25,8 @@ class StandingLongJumpSystem:
             mat_width_cm=config.mat_width_cm,
             manual_mode=config.manual_calib,
         )
+        self.contour_detector = ContourDetector(self.calibrator)
+        self.shoe_detector = ShoeEdgeDetector(self.calibrator)
         self.kpt_idx = {
             "l_hip": 23, "r_hip": 24,
             "l_ankle": 27, "r_ankle": 28,
@@ -306,22 +310,22 @@ class StandingLongJumpSystem:
         self._log("STATE", "IDLE -> READY")
         self._reset_round_state()
         self._prev_frame_img = frame.copy()
-        area = self.calibrator.get_person_area_px(frame)
-        front_x = self.calibrator.get_person_front_x_cm(frame)
+        area = self.contour_detector.get_person_area_px(frame)
+        front_x = self.contour_detector.get_person_front_x_cm(frame)
         self._person_area_baseline = area if area > 500 else 2000.0
         self._front_x_baseline = front_x if front_x is not None else 0.0
         self._log("READY", f"面积基线={self._person_area_baseline:.0f}px, 前缘X={self._front_x_baseline:.1f}cm")
 
     def _handle_idle(self, frame):
         self.foul_detector.reset()
-        area = self.calibrator.get_person_area_px(frame)
+        area = self.contour_detector.get_person_area_px(frame)
         if area > 500:
             self._log("IDLE", f"检测到人体进入垫内, 轮廓面积={area:.0f}px")
             self._enter_ready_state(frame)
 
     def _handle_ready(self, frame_idx, frame):
-        area = self.calibrator.get_person_area_px(frame)
-        front_x = self.calibrator.get_person_front_x_cm(frame)
+        area = self.contour_detector.get_person_area_px(frame)
+        front_x = self.contour_detector.get_person_front_x_cm(frame)
 
         if self._person_area_baseline is None:
             self._person_area_baseline = area if area > 500 else 2000.0
@@ -330,7 +334,7 @@ class StandingLongJumpSystem:
 
         # ROI 鞋子前缘检测（当有骨架关键点时更精确）
         if self._last_kpts is not None:
-            roi_front_x, _ = self.calibrator.detect_shoe_front_x_cm(frame, self._last_kpts)
+            roi_front_x, _ = self.shoe_detector.detect_shoe_front_x_cm(frame, self._last_kpts)
             if roi_front_x is not None and 0 < roi_front_x < 350:
                 self._front_x_cm_hist.append(roi_front_x)
         # 后备：无骨架时用轮廓法
@@ -414,7 +418,7 @@ class StandingLongJumpSystem:
 
         if self._jump_frame_counter >= self.config.min_flight_frames:
             if kpts is not None:
-                shoe_x, edge_vis = self.calibrator.get_shoe_landing_x_cm(frame, kpts)
+                shoe_x, edge_vis = self.shoe_detector.get_shoe_landing_x_cm(frame, kpts)
                 if shoe_x is not None and 0 < shoe_x < 350:
                     self._landing_stable_counter += 1
                     landing_x_from_shoe = shoe_x
@@ -446,7 +450,7 @@ class StandingLongJumpSystem:
             landing_x = landing_x_from_shoe
         else:
             # 后备：用垫子轮廓法
-            back_x = self.calibrator.get_person_back_x_cm(frame)
+            back_x = self.contour_detector.get_person_back_x_cm(frame)
             if back_x is not None and 0 < back_x < 350:
                 landing_x = back_x
             else:
@@ -481,10 +485,10 @@ class StandingLongJumpSystem:
     # ═══════════════════════════════════════════════
 
     def _save_diff_image(self, tag, frame):
-        """保存当前帧的垫子差分热力图到 images 目录。"""
-        if not self.images_dir:
+        """保存当前帧的垫子差分热力图到 images 目录（skeleton 模式下不输出）。"""
+        if not self.images_dir or self._detection_method == "skeleton":
             return
-        diff_img = self.calibrator.render_diff_image(frame)
+        diff_img = self.contour_detector.render_diff_image(frame)
         if diff_img is not None:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             filename = os.path.join(self.images_dir, f"diff-{tag}-{ts}.jpeg")
@@ -790,7 +794,7 @@ class StandingLongJumpSystem:
                         self.calibrator.mat_locked = True
                         self._log("CALIB", "垫子标定完成")
                         # 记录基线帧（干净垫子参考）
-                        self.calibrator.set_baseline_frame(frame)
+                        self.contour_detector.set_baseline_frame(frame)
                         self._log("CALIB", "基线帧已保存")
                         # 保存两张垫子识别图
                         if self.images_dir:

@@ -18,16 +18,12 @@ from datetime import datetime
 from src.config import JumpConfig, resolve_video_source, make_result_dir
 from src.core.jump_system import StandingLongJumpSystem
 
-# ── conda 环境中的 Python 执行器 ──
-CONDA_PYTHON = r"C:\Users\admin\.conda\envs\tiaoyuan\python.exe"
-
 
 def build_parser():
     parser = argparse.ArgumentParser(description="立定跳远自动检测系统")
     parser.add_argument("--video", type=str, default="0", help="视频文件路径或摄像头索引 (默认 0)")
     parser.add_argument("--save", type=str, default="result.json", help="结果 JSON 文件名")
     parser.add_argument("--no-display", action="store_true", help="不显示预览窗口（批量模式默认启用）")
-    parser.add_argument("--model", type=str, default="yolo11n-pose.pt")
     parser.add_argument("--backend", type=str, default="mediapipe")
     parser.add_argument("--debug-dir", type=str, default=None)
     parser.add_argument("--record", type=str, default=None, help="录制输出视频路径")
@@ -67,7 +63,6 @@ def run_single(video_path, args):
         video_source=video_path,
         save_path=save_path,
         display=False,
-        model=args.model,
         backend=args.backend,
         debug_dir=args.debug_dir,
         record_path=args.record,
@@ -171,7 +166,6 @@ def main():
         video_source=resolve_video_source(args.video),
         display=not args.no_display,
         save_path=os.path.join(result_dir, "result.json"),
-        model=args.model,
         backend=args.backend,
         debug_dir=args.debug_dir,
         record_path=args.record,

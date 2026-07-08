@@ -25,3 +25,6 @@ Thumbs.db
 # 临时测试
 test_*.py
 stderr.log
+
+# ultralytics 源码（已移除）
+ultralytics-*/

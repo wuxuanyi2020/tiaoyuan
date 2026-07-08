@@ -9,9 +9,8 @@ class JumpConfig:
     video_source: object = 0
     display: bool = True
     save_path: str = "result.json"
-    model: str = "yolo11n-pose.pt"
     debug_dir: str | None = None
-    mat_length_cm: float = 350.0
+    mat_length_cm: float = 340.0
     mat_width_cm: float = 90.0
     trigger_move_cm: float = 30.0
     trigger_frames: int = 2
@@ -19,12 +18,12 @@ class JumpConfig:
     max_jump_frames: int = 120
     backend: str = "mediapipe"
     record_path: str | None = None
-    takeoff_line_cm: float = 30.0
-    takeoff_offset_cm: float = 4.0
+    takeoff_line_cm: float = 32.0
+    takeoff_offset_cm: float = 0.0
     manual_calib: bool = False
     result_dir: str | None = None  # 结果输出根目录，由 main 在运行时传入
     enable_foul_detection: bool = True
-    landing_offset_cm: float = -4.0  # 落地点修正（鞋跟厚度补偿）
+    landing_offset_cm: float = -5.0  # 落地点修正（鞋跟厚度补偿）
     detection_method: str = "contour"  # 检测方式: "contour"(差分) / "skeleton"(骨骼关键点)
 
 
