@@ -39,9 +39,6 @@ def build_parser():
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
     parser.add_argument("--landing-offset-cm", type=float, default=-5.0,
                         help="落地点修正值(cm)，补偿鞋后跟厚度，默认-5.0（负值缩短距离）")
-    parser.add_argument("--detection-method", type=str, default="contour",
-                        choices=["contour", "skeleton"],
-                        help="检测方式: contour(差分法, 默认) / skeleton(骨骼关键点法)")
     parser.add_argument("--debug", action="store_true", help="调试模式：输出起跳/落地触发条件到日志")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
@@ -79,7 +76,6 @@ def run_single(video_path, args):
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
-        detection_method=args.detection_method,
         debug=args.debug,
     )
     StandingLongJumpSystem(config).run()
@@ -183,7 +179,6 @@ def main():
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
-        detection_method=args.detection_method,
         debug=args.debug,
     )
     StandingLongJumpSystem(config).run()

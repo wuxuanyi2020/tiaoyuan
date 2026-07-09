@@ -17,6 +17,9 @@ videos/
 *.avi
 *.mov
 
+# 环境变量
+.env
+
 # 系统
 *.log
 Thumbs.db

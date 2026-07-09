@@ -24,7 +24,6 @@ class JumpConfig:
     result_dir: str | None = None  # 结果输出根目录，由 main 在运行时传入
     enable_foul_detection: bool = True
     landing_offset_cm: float = -5.0  # 落地点修正（鞋跟厚度补偿）
-    detection_method: str = "contour"  # 检测方式: "contour"(差分) / "skeleton"(骨骼关键点)
     debug: bool = False  # 调试模式：起跳/落地时输出触发条件到日志
 
 
