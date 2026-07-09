@@ -1,17 +1,15 @@
 # 立定跳远自动检测系统
 
-基于 OpenCV + MediaPipe 的立定跳远成绩自动检测系统。支持视频输入，自动识别垫子区域、检测起跳/落地点、计算距离、判定犯规。
+基于 OpenCV + MediaPipe 骨骼关键点（Skeleton）的立定跳远成绩自动检测系统。支持视频输入，自动识别垫子区域、检测起跳/落地点、计算距离、判定犯规。
 
 ## 功能特性
 
 - **自动标定**: 通过 HSV 颜色分割自动识别绿色跳远垫子，生成透视变换矩阵
-- **双模式检测**:
-  - `contour` (差分法) — 基于垫子色反色提取人体轮廓，通过轮廓面积骤降判定起跳
-  - `skeleton` (骨骼关键点) — 基于 MediaPipe 33 点骨骼，通过脚尖位移和脚踝离地判定起跳
+- **骨骼关键点检测**: 基于 MediaPipe 33 点骨骼，通过脚尖位移、髋部移动和脚踝离地判定起跳，通过脚后跟 Y 坐标触底检测落地
 - **犯规检测**: 踩线、垫步、单脚起跳、多人入界、出界、撑杆辅助
 - **鞋子边缘修正**: Canny + ROI 局部检测，补偿骨骼关键点在鞋底位置上的偏差
 - **批量处理**: 支持一次性跑多段视频并生成汇总 CSV
-- **结果可视化**: 垫子标定图、差分热力图、犯规截图、落地标注图
+- **结果可视化**: 垫子标定图、犯规截图、落地标注图
 
 ## 环境要求
 
@@ -36,11 +34,7 @@ pip install opencv-python numpy mediapipe Pillow -i https://pypi.tuna.tsinghua.e
 ### 单视频处理
 
 ```bash
-# 差分法（默认）
 python main.py --video videos/跳远1-1.mp4 --no-display
-
-# 骨骼关键点法
-python main.py --video videos/跳远1-1.mp4 --no-display --detection-method skeleton
 ```
 
 ### 批量处理
@@ -68,7 +62,6 @@ python main.py --video videos/跳远1-1.mp4
 | `--batch` | - | 批量处理 `videos/` 下跳远1-1 ~ 跳远1-9 |
 | `--videos` | - | 批量处理指定视频列表 |
 | `--no-display` | - | 不显示预览窗口 |
-| `--detection-method` | `contour` | 检测方式: `contour` / `skeleton` |
 | `--mat-length-cm` | `340.0` | 垫子长度 (cm) |
 | `--mat-width-cm` | `90.0` | 垫子宽度 (cm) |
 | `--takeoff-line-cm` | `32.0` | 起跳线位置 (cm) |
@@ -89,8 +82,6 @@ result/
         ├── images/
         │   ├── mat_mask_quad.jpeg   # 垫子识别图（四边形拟合）
         │   ├── mat_mask_hsv.jpeg    # 垫子识别图（HSV 原始）
-        │   ├── diff-takeoff-*.jpeg  # 起跳差分热力图
-        │   ├── diff-landing-*.jpeg  # 落地差分热力图
         │   ├── foul-*.jpeg          # 犯规截图
         │   └── landed-*.jpeg        # 落地标注图
         └── logs/
@@ -122,7 +113,6 @@ tiaoyuan/
 │   │   └── jump_system.py           # 核心状态机 (IDLE→READY→JUMPING→LANDED)
 │   ├── inference/
 │   │   ├── mat_calibration.py       # MatCalibrator: 垫子标定 & 透视变换
-│   │   ├── contour_detector.py      # ContourDetector: 差分 & 人体轮廓
 │   │   ├── shoe_detector.py         # ShoeEdgeDetector: ROI 鞋子边缘检测
 │   │   └── pose_estimator.py        # PoseEstimator: MediaPipe 姿态推理
 │   ├── rules/
@@ -132,24 +122,20 @@ tiaoyuan/
 └── videos/                          # 视频文件（不纳入版本管理）
 ```
 
-## 检测原理
+## 检测原理（Skeleton 骨骼关键点法）
 
-### Contour 模式 (差分法)
-
-1. 标定阶段记录干净垫子作为基线帧
-2. 通过垫子绿色反色提取垫上人体 mask
-3. 当人体轮廓面积骤降至基线 30% 以下时，判定起跳
-4. 取前缘 X 坐标历史均值作为起跳点
-5. 结合 MediaPipe 鞋子边缘检测获取精确落地点
-
-### Skeleton 模式 (骨骼关键点)
-
-1. 通过 MediaPipe 获取 33 点骨骼坐标
-2. 稳定站立阶段记录脚尖基线 X 和脚踝 Y 基线（EMA 平滑更新）
-3. 稳定期 > 10 帧后检测脚尖前移 / 髋部移动 / 脚踝离地 → 起跳
-4. 稳定期 > 35 帧后突然置 0 也视为起跳触发
-5. 起跳计数器 >= 1 即确认起跳
-6. 检测脚后跟 Y 坐标触底（V 型谷底）→ 落地
+1. **垫子标定**: HSV 颜色分割自动识别绿色垫子，通过轮廓拟合四边形并计算透视变换矩阵
+2. **人体检测**: 通过 MediaPipe PoseLandmarker 获取每帧 33 个骨骼关键点坐标（含脚趾、脚踝、脚后跟）
+3. **站立稳定期**: 稳定站立阶段记录脚尖基线 X 和脚踝 Y 基线（EMA 平滑更新），稳定帧数积累
+4. **起跳判定**（满足任一）:
+   - 脚尖前移 > max(trigger_move_cm, 30.0)
+   - 髋部前移 > 35cm 且脚尖前移 > 10cm
+   - 脚踝离地 > 20px 且脚尖前移 > 3cm 且稳定帧数归零
+   - 稳定期 > 35 帧后突然置零
+   - 脚尖关键点连续缺失 ≥ 3 帧且脚尖前移 > −3cm
+5. **起跳点取值**: 使用触发前一帧的数据倒推，避免触发帧脚已离地前移导致的误差
+6. **落地检测**: 脚后跟 Y 坐标触底（V 型谷底模式）+ 连续帧阈值确认
+7. **成绩计算**: landing_x − takeoff_x + landing_offset (−5cm 补偿鞋后跟厚度)
 
 ## 犯规规则
 
