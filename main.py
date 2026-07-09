@@ -34,11 +34,11 @@ def build_parser():
     parser.add_argument("--min-flight-frames", type=int, default=5)
     parser.add_argument("--max-jump-frames", type=int, default=120)
     parser.add_argument("--takeoff-line-cm", type=float, default=32.0)
-    parser.add_argument("--takeoff-offset-cm", type=float, default=6.0)
+    parser.add_argument("--takeoff-offset-cm", type=float, default=0.0)
     parser.add_argument("--manual-calib", action="store_true", help="手动四点标定（需鼠标点击）")
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
-    parser.add_argument("--landing-offset-cm", type=float, default=-6.0,
-                        help="落地点修正值(cm)，补偿鞋后跟厚度，默认-6.0（负值缩短距离）")
+    parser.add_argument("--landing-offset-cm", type=float, default=-5.0,
+                        help="落地点修正值(cm)，补偿鞋后跟厚度，默认-5.0（负值缩短距离）")
     parser.add_argument("--detection-method", type=str, default="contour",
                         choices=["contour", "skeleton"],
                         help="检测方式: contour(差分法, 默认) / skeleton(骨骼关键点法)")

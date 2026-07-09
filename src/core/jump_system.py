@@ -110,6 +110,7 @@ class StandingLongJumpSystem:
         self._skeleton_toe_y_px_hist = deque(maxlen=12)
         self._skeleton_toe_missing_counter = 0
         self._skeleton_jump_counter = 0
+        self._skeleton_prev_takeoff_data = None  # 前一帧的起跳相关数据，用于倒推起跳点
         self._skeleton_foot_hist = {
             "l": {"y_px": deque(maxlen=3), "x_cm": deque(maxlen=3), "y_cm": deque(maxlen=3), "xy_px": deque(maxlen=3)},
             "r": {"y_px": deque(maxlen=3), "x_cm": deque(maxlen=3), "y_cm": deque(maxlen=3), "xy_px": deque(maxlen=3)},
@@ -164,11 +165,13 @@ class StandingLongJumpSystem:
             right = self._get_kpt(kpts, self.kpt_idx["r_big_toe"])
             if left is not None or right is not None:
                 return {"l": left, "r": right}
+            return {"l": None, "r": None}
         if kind == "heel" and len(kpts) > 22:
             left = self._get_kpt(kpts, self.kpt_idx["l_heel"])
             right = self._get_kpt(kpts, self.kpt_idx["r_heel"])
             if left is not None or right is not None:
                 return {"l": left, "r": right}
+            return {"l": None, "r": None}
         left = self._get_kpt(kpts, self.kpt_idx["l_ankle"])
         right = self._get_kpt(kpts, self.kpt_idx["r_ankle"])
         return {"l": left, "r": right}
@@ -212,6 +215,7 @@ class StandingLongJumpSystem:
         self._skeleton_toe_y_px_hist.clear()
         self._skeleton_toe_missing_counter = 0
         self._skeleton_jump_counter = 0
+        self._skeleton_prev_takeoff_data = None
         for side in ["l", "r"]:
             for q in self._skeleton_foot_hist[side].values():
                 q.clear()
@@ -411,7 +415,8 @@ class StandingLongJumpSystem:
             self._jump_frame_counter = 0
             self.takeoff_frame = frame_idx
             self.takeoff_x_cm = takeoff_x + self.takeoff_display_offset_cm
-            self._save_takeoff_image(frame, self._last_kpts)
+            self._save_takeoff_image(frame, self._last_kpts,
+                                     list(self.pose_estimator.all_kpts_list) if self.pose_estimator.all_kpts_list else [])
             self.takeoff_pt_px = None
             self.takeoff_pt_xy = None
             self._takeoff_frame_img = frame.copy()
@@ -527,10 +532,12 @@ class StandingLongJumpSystem:
         return None, None
 
     def _skeleton_enter_ready(self, ankle_cm, front_toe_cm):
+        if front_toe_cm is None or not self.calibrator.in_mat(front_toe_cm):
+            return
         self.state = "READY"
         self._log("STATE", "IDLE -> READY")
         self._reset_round_state()
-        self._skeleton_baseline_x_cm = front_toe_cm[0] if front_toe_cm is not None and self.calibrator.in_mat(front_toe_cm) else ankle_cm[0]
+        self._skeleton_baseline_x_cm = front_toe_cm[0]
         self._log("READY", f"骨架法基线X={self._skeleton_baseline_x_cm:.1f}cm")
 
     def _handle_idle_skeleton(self, ankle_cm, front_toe_cm):
@@ -549,7 +556,10 @@ class StandingLongJumpSystem:
         if ankle_cm is None:
             return
 
-        cur_x = front_toe_cm[0] if front_toe_cm is not None and self.calibrator.in_mat(front_toe_cm) else ankle_cm[0]
+        if front_toe_cm is None or not self.calibrator.in_mat(front_toe_cm):
+            return  # 无脚尖位置数据，跳过本帧（不用脚踝替代起跳点）
+
+        cur_x = front_toe_cm[0]
         if self._skeleton_baseline_x_cm is None:
             self._skeleton_baseline_x_cm = cur_x
         if self._skeleton_baseline_hip_x is None and hip_cm:
@@ -558,6 +568,8 @@ class StandingLongJumpSystem:
             self._skeleton_baseline_ankle_y = curr_ankle_y_px
 
         toe_moved = cur_x - self._skeleton_baseline_x_cm
+        raw_toe_moved = toe_moved  # 保存原始值（重置前）
+        raw_hip_moved = (hip_cm[0] - self._skeleton_baseline_hip_x) if (hip_cm and self._skeleton_baseline_hip_x) else 0  # 保存重置前的 hip_moved
         stable_before_update = self._skeleton_ready_stable
         stable_reset_after_ready = False
         if abs(toe_moved) < 6.0:
@@ -592,19 +604,19 @@ class StandingLongJumpSystem:
         if toe_moved > max(self.config.trigger_move_cm, 30.0):
             is_taking_off = True
             takeoff_reason = f"toe_moved={toe_moved:.1f} > max(trigger_move_cm={self.config.trigger_move_cm}, 30.0)"
-        elif hip_moved > 35.0 and toe_moved > 7.0:
+        elif hip_moved > 35.0 and toe_moved > 10.0:
             is_taking_off = True
             takeoff_reason = f"hip_moved={hip_moved:.1f}>35.0 and toe_moved={toe_moved:.1f}>4.0"
-        elif ankle_lifted and toe_moved > 3.0:
+        elif ankle_lifted and toe_moved > 3.0 and self._skeleton_ready_stable == 0:
             is_taking_off = True
-            takeoff_reason = f"ankle_lifted={ankle_lifted_px:.1f}px>20.0px and toe_moved={toe_moved:.1f}>3.0"
+            takeoff_reason = f"ankle_lifted={ankle_lifted_px:.1f}px>20.0px and toe_moved={toe_moved:.1f}>3.0 and stable=0"
 
         trigger_count = self._skeleton_jump_trigger_counter
         stable_gate_passed = self._skeleton_ready_stable >= 10 or stable_reset_after_ready
         self._skeleton_jump_trigger_counter = (trigger_count + 1 if is_taking_off else 0) if stable_gate_passed else 0
 
         if self.debug:
-            self._log("DEBUG_TAKEOFF_PARAMS", f"帧{frame_idx}: toe_moved={toe_moved:.1f} | hip_moved={hip_moved:.1f} | "
+            self._log("DEBUG_TAKEOFF_PARAMS", f"帧{frame_idx}: toe_moved={toe_moved:.1f}(raw={raw_toe_moved:.1f}) | hip_moved={hip_moved:.1f}(raw={raw_hip_moved:.1f}) | "
                       f"ankle_lifted_px={ankle_lifted_px:.1f}(lifted={ankle_lifted}) | toe_missing={self._skeleton_toe_missing_counter} | "
                       f"trigger={self._skeleton_jump_trigger_counter}/1 | stable={self._skeleton_ready_stable} | stable_before={stable_before_update} | "
                       f"stable_reset_after_ready={stable_reset_after_ready} | is_taking_off={is_taking_off} | reason={takeoff_reason or '无'}")
@@ -613,30 +625,59 @@ class StandingLongJumpSystem:
             self._skeleton_front_toe_hist.append((float(front_toe_cm[0]), float(front_toe_cm[1]), float(front_toe_xy[0]), float(front_toe_xy[1])))
 
         if self._skeleton_jump_trigger_counter < 1:
+            # 未起跳：保存本帧数据作为下一帧起跳时的倒推候选
+            self._skeleton_prev_takeoff_data = {
+                "front_toe_cm": front_toe_cm,
+                "front_toe_xy": front_toe_xy,
+                "toe_xy": toe_xy,
+                "ankle_xy": ankle_xy,
+                "frame_idx": frame_idx,
+                "kpts": kpts,
+                "all_kpts_list": list(self.pose_estimator.all_kpts_list) if self.pose_estimator.all_kpts_list else [],
+                "frame_img": self._prev_frame_img.copy() if self._prev_frame_img is not None else None,
+            }
             return
 
-        takeoff_x = front_toe_cm[0] if front_toe_cm is not None else self._skeleton_baseline_x_cm
+        # 起跳确认：使用前一帧的数据精确倒推起跳点（避免触发帧脚已离地前移）
+        prev = self._skeleton_prev_takeoff_data
+        if prev is not None and prev["front_toe_cm"] is not None:
+            takeoff_x = prev["front_toe_cm"][0]
+            takeoff_frame = prev["frame_idx"]
+            takeoff_pt_px = (prev["front_toe_xy"] if prev["front_toe_xy"] is not None
+                             else (prev["toe_xy"] if prev["toe_xy"] is not None else prev["ankle_xy"]))
+            takeoff_kpts = prev["kpts"]
+            takeoff_img = prev["frame_img"]
+            takeoff_all_kpts = prev.get("all_kpts_list", [])
+        else:
+            # 无前一帧数据时回退到当前帧
+            takeoff_x = front_toe_cm[0]
+            takeoff_frame = frame_idx
+            takeoff_pt_px = front_toe_xy if front_toe_xy is not None else (toe_xy if toe_xy else ankle_xy)
+            takeoff_kpts = kpts
+            takeoff_img = self._prev_frame_img if self._prev_frame_img is not None else frame
+            takeoff_all_kpts = list(self.pose_estimator.all_kpts_list) if self.pose_estimator.all_kpts_list else []
+
         if self.debug:
-            self._log("DEBUG_TAKEOFF", f"帧{frame_idx}: 起跳触发 | reason={takeoff_reason} | baseline_x={takeoff_x:.1f}cm | stable={self._skeleton_ready_stable}帧 | trigger={self._skeleton_jump_trigger_counter}/1帧")
-        self._log("JUMP", f"起跳成功(骨架)！稳定期={self._skeleton_ready_stable}帧, 起跳点={takeoff_x:.1f}cm")
+            self._log("DEBUG_TAKEOFF", f"帧{takeoff_frame}(<-{frame_idx}): 起跳触发 | reason={takeoff_reason} | takeoff_x={takeoff_x:.1f}cm | stable={self._skeleton_ready_stable}帧 | trigger={self._skeleton_jump_trigger_counter}/1帧")
+        self._log("JUMP", f"起跳成功(骨架)！稳定期={self._skeleton_ready_stable}帧, 起跳点={takeoff_x:.1f}cm(倒推自帧{takeoff_frame})")
 
         self.foul_detector.check_step_jump(self._skeleton_front_toe_hist, self._skeleton_baseline_x_cm)
-        self.foul_detector.check_single_leg_takeoff(kpts)
+        self.foul_detector.check_single_leg_takeoff(takeoff_kpts)
         self.foul_detector.check_line_violation(takeoff_x, self.config.takeoff_line_cm)
-        self.foul_detector.check_prop_assistance(kpts)
+        self.foul_detector.check_prop_assistance(takeoff_kpts)
         if self.foul_detector.reason:
             self._log("FOUL", f"起跳时检测到犯规: {self.foul_detector.reason}")
 
-        self._save_diff_image("takeoff", self._prev_frame_img if self._prev_frame_img is not None else self._takeoff_frame_img)
+        self._save_diff_image("takeoff", takeoff_img if takeoff_img is not None else self._takeoff_frame_img)
         self.state = "JUMPING"
         self._log("STATE", "READY -> JUMPING")
         self._skeleton_jump_counter = 0
-        self.takeoff_frame = frame_idx
-        self.takeoff_pt_px = front_toe_xy if front_toe_xy is not None else (toe_xy if toe_xy else ankle_xy)
+        self.takeoff_frame = takeoff_frame
+        self.takeoff_pt_px = takeoff_pt_px
         self.takeoff_pt_xy = self.takeoff_pt_px
         self.takeoff_x_cm = takeoff_x + self.takeoff_display_offset_cm
-        self._save_takeoff_image(self._prev_frame_img if self._prev_frame_img is not None else frame, kpts)
-        self._takeoff_frame_img = self._prev_frame_img.copy() if self._prev_frame_img is not None else None
+        self._save_takeoff_image(takeoff_img if takeoff_img is not None else frame, takeoff_kpts, takeoff_all_kpts)
+        self._takeoff_frame_img = takeoff_img.copy() if takeoff_img is not None else None
 
     def _handle_jumping_skeleton(self, frame_idx, heel_l_xy, heel_r_xy, heel_l_cm, heel_r_cm):
         self._skeleton_jump_counter += 1
@@ -719,10 +760,11 @@ class StandingLongJumpSystem:
             self._landing_frame_img = None
 
     # ---------- 结果保存 ----------
-    def _save_takeoff_image(self, frame, kpts=None):
+    def _save_takeoff_image(self, frame, kpts=None, all_kpts_list=None):
         """保存起跳帧图像（含骨架、垫子轮廓、起跳线标注）。"""
         if not self.images_dir or self._takeoff_saved:
             return
+        all_kpts = all_kpts_list if all_kpts_list is not None else (self.pose_estimator.all_kpts_list or [])
         img = frame.copy()
         self.renderer.draw_mat_outline(img, self.calibrator)
         self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
@@ -730,10 +772,9 @@ class StandingLongJumpSystem:
         if kpts is not None:
             self.renderer.draw_pose(img, kpts, self.pose_estimator.mp_connections, color=(0, 255, 0))
             self.renderer.draw_feet(img, self._get_feet, kpts)
-        if self.pose_estimator.all_kpts_list:
-            for pk in self.pose_estimator.all_kpts_list:
-                self.renderer.draw_pose(img, pk, self.pose_estimator.mp_connections, color=(0, 255, 0))
-                self.renderer.draw_feet(img, self._get_feet, pk)
+        for pk in all_kpts:
+            self.renderer.draw_pose(img, pk, self.pose_estimator.mp_connections, color=(0, 255, 0))
+            self.renderer.draw_feet(img, self._get_feet, pk)
         if self.takeoff_x_cm is not None:
             self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
                                       self.takeoff_x_cm, (0, 255, 255), thickness=2, label="Takeoff")
