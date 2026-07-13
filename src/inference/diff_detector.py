@@ -17,6 +17,7 @@
 """
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 
 class DiffDetector:
@@ -43,13 +44,45 @@ class DiffDetector:
             return DiffDetector._FOOT_CONFIGS_TOE
         return DiffDetector._FOOT_CONFIGS_HEEL
 
-    def __init__(self, calibrator):
+    @staticmethod
+    def _put_text_cn(img, text, pos, color, size=28):
+        """使用 PIL 在 OpenCV 图像上渲染中文文本，避免 cv2.putText 中文乱码。"""
+        if img is None:
+            return img
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        font = None
+        for path in ["msyh.ttc", "simhei.ttf", "simsun.ttc",
+                      "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+                      "C:/Windows/Fonts/simsun.ttc"]:
+            try:
+                font = ImageFont.truetype(path, size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                return img
+        draw.text(pos, text, font=font, fill=color[::-1])
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+    def __init__(self, calibrator, enable_seg=False):
         self._calib = calibrator
+        self.enable_seg = enable_seg
 
         # ── 基准帧 ──
         self._base_frame_raw = None
         self._base_frame_gray = None
         self._base_frame_captured = False
+
+        # ── YOLO 实例分割模型 ──
+        self.seg_model = None
+        if self.enable_seg:
+            from ultralytics import YOLO
+            self.seg_model = YOLO("yolo11n-seg.pt")
+            print("[DIFF] YOLOv11-seg 实例分割已启用 (模型: yolo11n-seg.pt)")
 
         # ── 全帧差分二值 Mask（供可视化） ──
         self.takeoff_diff_mask = None
@@ -160,19 +193,52 @@ class DiffDetector:
         mag = np.sqrt((grad_x * 1.5) ** 2 + (grad_y * 0.4) ** 2)
         return np.clip(mag, 0, 255).astype(np.uint8)
 
-    def _foot_diff_mask(self, frame_gray, kpts, foot_indices,
+    def _foot_diff_mask(self, frame_bgr, kpts, foot_indices,
                         is_left=True, shrink_inward=0.0):
-        """MOG2 去阴影 + 轮廓实心填充：比边缘差分更干净的前景提取。
+        """提取脚部 ROI 内的鞋子二值 Mask。
 
-        步骤:
-          1. 切出 ROI（当前帧 + 基准帧相同区域）
-          2. MOG2 背景建模：base_roi 训练背景 → current_roi 提取前景
-          3. 阈值过滤阴影（fg_mask 中 127=阴影，255=前景物体）
-          4. 形态学去噪 + 外轮廓查找 + 实心填充
+        根据 self.enable_seg 选择两种实现之一：
+          - True:  使用 YOLOv11-seg 在全图上做实例分割，再按关键点 ROI 裁剪
+          - False: 使用 MOG2 背景差分 + 轮廓实心填充（原有逻辑）
 
         返回:
             (binary_mask, origin_xy) 或 None
         """
+        # ── YOLOv11-seg 路径：先在全图上推理，再按 ROI 裁剪 ──
+        if self.enable_seg:
+            img_h, img_w = frame_bgr.shape[:2]
+            # 全图推理：只筛选 person 类
+            results = self.seg_model(frame_bgr, classes=[0], conf=0.3, verbose=False)
+
+            # 在全图尺寸上构建二值人体 Mask
+            full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+            if len(results) > 0 and results[0].masks is not None:
+                for mask_xy in results[0].masks.xy:
+                    pts = np.array([mask_xy], dtype=np.int32)
+                    cv2.fillPoly(full_mask, [pts], 255)
+
+            # 通过关键点获取 ROI 坐标（在灰度图上计算，不依赖分割结果）
+            frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            roi_result = self._foot_roi_gray(
+                frame_gray, kpts, foot_indices,
+                is_left=is_left, shrink_inward=shrink_inward,
+            )
+            if roi_result is None:
+                return None
+
+            _, (x1, y1) = roi_result
+            h_roi, w_roi = roi_result[0].shape
+
+            # 从全图 Mask 中裁剪出 ROI 区域
+            solid_mask = full_mask[y1:y1 + h_roi, x1:x1 + w_roi].copy()
+
+            # 工程 Trick：上半部分（前 40% 高度）置零，只保留贴近地面的鞋子部分
+            solid_mask[0:int(h_roi * 0.4), :] = 0
+
+            return solid_mask, (x1, y1)
+
+        # ── MOG2 路径：先获取 ROI，再在 ROI 内做差分 ──
+        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         roi_result = self._foot_roi_gray(
             frame_gray, kpts, foot_indices,
             is_left=is_left, shrink_inward=shrink_inward,
@@ -180,20 +246,17 @@ class DiffDetector:
         if roi_result is None:
             return None
 
-        roi_current, (x1, y1) = roi_result
-        h_roi, w_roi = roi_current.shape
+        roi_gray, (x1, y1) = roi_result
+        h_roi, w_roi = roi_gray.shape
 
         base_roi = self._base_frame_gray[y1:y1 + h_roi, x1:x1 + w_roi]
-        if base_roi.shape != roi_current.shape:
+        if base_roi.shape != roi_gray.shape:
             return None
 
-        # ── MOG2 背景建模 ──
-        # 注意: detectShadows=True 会把黑鞋（变暗区域）标为 127 → 视为阴影，
-        # 所以我们取所有非零值(>0)，阴影和前景都保留，靠轮廓填充来连成完整鞋区
         bg_sub = cv2.createBackgroundSubtractorMOG2(
             history=2, varThreshold=20, detectShadows=True)
         bg_sub.apply(base_roi)          # 训练背景
-        fg_mask = bg_sub.apply(roi_current)  # 提取前景
+        fg_mask = bg_sub.apply(roi_gray)  # 提取前景
 
         # ── 保留所有非零值（含阴影 127 和前景 255） ──
         _, binary = cv2.threshold(fg_mask, 1, 255, cv2.THRESH_BINARY)
@@ -216,16 +279,16 @@ class DiffDetector:
     # 左右脚差分融合 & 鞋边缘提取
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _compute_shoe_extreme(self, frame_gray, kpts, edge_side):
+    def _compute_shoe_extreme(self, frame_bgr, kpts, edge_side):
         """对左右脚分别做边缘差分，融合后找鞋子最前/最后边缘。
 
         边缘差分 Mask 本身就是鞋子轮廓的边缘响应图，
         Mask 内最极端 X 坐标即为目标边缘（脚尖/脚后跟）。
 
         Args:
-            frame_gray: 当前帧灰度图
-            kpts:       当前帧关键点
-            edge_side:  "toe"（脚尖, X 最大）或 "heel"（脚后跟, X 最小）
+            frame_bgr: 当前帧彩色 BGR 图像
+            kpts:      当前帧关键点
+            edge_side: "toe"（脚尖, X 最大）或 "heel"（脚后跟, X 最小）
 
         返回:
             x_cm: 鞋子边缘在垫子坐标系下的 X 值(cm)
@@ -239,7 +302,7 @@ class DiffDetector:
         for cfg in foot_configs:
             is_left = (cfg["label"] == "left")
             result = self._foot_diff_mask(
-                frame_gray, kpts, cfg["indices"],
+                frame_bgr, kpts, cfg["indices"],
                 is_left=is_left, shrink_inward=shrink_ratio,
             )
             if result is None:
@@ -279,7 +342,7 @@ class DiffDetector:
             best_cm, best_px = min(all_px_cm, key=lambda x: x[0])
 
         # 构建全帧差分 Mask
-        full_mask = np.zeros(frame_gray.shape, dtype=np.uint8)
+        full_mask = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
         for f in per_foot:
             x1f, y1f = f["origin"]
             hf, wf = f["binary"].shape
@@ -308,8 +371,7 @@ class DiffDetector:
             kpts = getattr(self, "_takeoff_kpts", None)
             if frame is None or kpts is None:
                 return None
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            x_cm = self._compute_shoe_extreme(gray, kpts, "toe")
+            x_cm = self._compute_shoe_extreme(frame, kpts, "toe")
             self.takeoff_shoe_x_cm = x_cm
             return x_cm
         except Exception:
@@ -323,8 +385,7 @@ class DiffDetector:
             kpts = getattr(self, "_landing_kpts", None)
             if frame is None or kpts is None:
                 return None
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            x_cm = self._compute_shoe_extreme(gray, kpts, "heel")
+            x_cm = self._compute_shoe_extreme(frame, kpts, "heel")
             self.landing_shoe_x_cm = x_cm
             return x_cm
         except Exception:
@@ -411,7 +472,7 @@ class DiffDetector:
 
             # 最终的实心填充 Mask
             mask_result = self._foot_diff_mask(
-                gray, kpts, cfg["indices"],
+                frame, kpts, cfg["indices"],
                 is_left=is_left, shrink_inward=0.3,
             )
             binary = mask_result[0] if mask_result is not None else np.zeros_like(roi_current)
@@ -448,9 +509,10 @@ class DiffDetector:
         title_h = 50
         canvas = np.zeros((title_h + collage.shape[0], collage.shape[1], 3), dtype=np.uint8)
         canvas[title_h:, :collage.shape[1]] = collage
-        cv2.putText(canvas,
-                    f"Stage3 - MOG2 ({label}): 原始图(左 vs 右) → MOG2 前景 → 实心填充Mask",
-                    (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        canvas = self._put_text_cn(
+            canvas,
+            f"Stage3 - MOG2 ({label}): 原始图(左 vs 右) → MOG2 前景 → 实心填充Mask",
+            (20, 6), (255, 255, 255), size=22)
         return canvas
 
     def render_result_image(self, mode="combined"):
@@ -460,8 +522,8 @@ class DiffDetector:
         # ── 阶段①：基准帧 ──
         if mode == "base":
             vis = self._base_frame_raw.copy()
-            cv2.putText(vis, "Stage1 - Base Frame (垫子标定范围无人)",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            vis = self._put_text_cn(vis, "Stage1 - Base Frame (垫子标定范围无人)",
+                                    (20, 8), (255, 255, 255), size=26)
             return vis
 
         # ── 阶段②：ROI 切割 ──
@@ -504,14 +566,14 @@ class DiffDetector:
             cv2.putText(vis, "Heel(EdgeDiff)", (pt[0] + 12, pt[1] - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        y_offset = 40
+        y_offset = 8
         title_map = {
             "takeoff":  "Stage4 - 起跳边缘差分(红)",
             "landing":  "Stage4 - 落地边缘差分(蓝)",
             "combined": "Stage4 - 边缘差分叠加(红+蓝=紫)",
         }
-        cv2.putText(vis, title_map.get(mode, ""), (20, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        vis = self._put_text_cn(vis, title_map.get(mode, ""), (20, y_offset),
+                                (255, 255, 255), size=26)
 
         y_offset = 80
         if mode in ("takeoff", "combined") and self.takeoff_shoe_x_cm is not None:

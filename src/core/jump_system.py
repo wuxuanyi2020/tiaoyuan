@@ -26,7 +26,7 @@ class StandingLongJumpSystem:
             manual_mode=config.manual_calib,
         )
         self.shoe_detector = ShoeEdgeDetector(self.calibrator)
-        self.diff_detector = DiffDetector(self.calibrator)
+        self.diff_detector = DiffDetector(self.calibrator, enable_seg=config.enable_seg)
         self.kpt_idx = {
             "l_hip": 23, "r_hip": 24,
             "l_ankle": 27, "r_ankle": 28,

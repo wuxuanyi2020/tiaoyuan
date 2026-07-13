@@ -40,7 +40,8 @@ def build_parser():
     parser.add_argument("--landing-offset-cm", type=float, default=-5.0,
                         help="落地点修正值(cm)，补偿鞋后跟厚度，默认-5.0（负值缩短距离）")
     parser.add_argument("--debug", action="store_true", help="调试模式：输出起跳/落地触发条件到日志")
-    parser.add_argument("--no-diff", action="store_true", help="禁用差分法距离修正（默认开启）")
+    parser.add_argument("--diff", action="store_true", help="启用 MOG2 背景差分法距离修正（默认关闭）")
+    parser.add_argument("--yolo", action="store_true", help="启用 YOLOv11-seg 实例分割距离修正（默认关闭）")
     parser.add_argument("--enable-mat-output", action="store_true", help="输出垫子识别图 (mat_mask_quad/hsv)")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
@@ -60,28 +61,29 @@ def run_single(video_path, args):
     save_path = os.path.join(result_dir, "result.json")
 
     config = JumpConfig(
-        video_source=video_path,
-        save_path=save_path,
-        display=False,
-        backend=args.backend,
-        debug_dir=args.debug_dir,
-        record_path=args.record,
-        mat_length_cm=args.mat_length_cm,
-        mat_width_cm=args.mat_width_cm,
-        trigger_move_cm=args.trigger_move_cm,
-        trigger_frames=args.trigger_frames,
-        min_flight_frames=args.min_flight_frames,
-        max_jump_frames=args.max_jump_frames,
-        takeoff_line_cm=args.takeoff_line_cm,
-        takeoff_offset_cm=args.takeoff_offset_cm,
-        manual_calib=args.manual_calib,
-        result_dir=result_dir,
-        enable_foul_detection=not args.no_foul_detection,
-        landing_offset_cm=args.landing_offset_cm,
-        enable_diff=not args.no_diff,
-        enable_mat_output=args.enable_mat_output,
-        debug=args.debug,
-    )
+            video_source=video_path,
+            save_path=save_path,
+            display=False,
+            backend=args.backend,
+            debug_dir=args.debug_dir,
+            record_path=args.record,
+            mat_length_cm=args.mat_length_cm,
+            mat_width_cm=args.mat_width_cm,
+            trigger_move_cm=args.trigger_move_cm,
+            trigger_frames=args.trigger_frames,
+            min_flight_frames=args.min_flight_frames,
+            max_jump_frames=args.max_jump_frames,
+            takeoff_line_cm=args.takeoff_line_cm,
+            takeoff_offset_cm=args.takeoff_offset_cm,
+            manual_calib=args.manual_calib,
+            result_dir=result_dir,
+            enable_foul_detection=not args.no_foul_detection,
+            landing_offset_cm=args.landing_offset_cm,
+            enable_diff=args.diff or args.yolo,
+            enable_mat_output=args.enable_mat_output,
+            enable_seg=args.yolo,
+            debug=args.debug,
+        )
     StandingLongJumpSystem(config).run()
 
     # 读取结果
@@ -183,8 +185,9 @@ def main():
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
-        enable_diff=not args.no_diff,
+        enable_diff=args.diff or args.yolo,
         enable_mat_output=args.enable_mat_output,
+        enable_seg=args.yolo,
         debug=args.debug,
     )
     StandingLongJumpSystem(config).run()

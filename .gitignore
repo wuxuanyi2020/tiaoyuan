@@ -31,3 +31,9 @@ stderr.log
 
 # ultralytics 源码（已移除）
 ultralytics-*/
+
+# 模型文件
+*.pt
+
+# 凭据
+github_token.txt
