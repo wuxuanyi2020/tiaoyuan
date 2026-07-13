@@ -6,7 +6,7 @@
 
 - **自动标定**: 通过 HSV 颜色分割自动识别绿色跳远垫子，生成透视变换矩阵
 - **骨骼关键点检测**: 基于 MediaPipe 33 点骨骼，通过脚尖位移、髋部移动和脚踝离地判定起跳，通过脚后跟 Y 坐标触底检测落地
-- **差分法/实例分割距离修正** (可选): 支持两种修正模式——MOG2 背景建模 + 轮廓实心填充（`--diff`），或 YOLOv11-seg 实例分割（`--yolo`），从基准帧（无人体）与起跳/落地帧的脚部 ROI 精确提取鞋子边缘位置，减少不同鞋子尺寸带来的误差
+- **差分法/实例分割距离修正** (可选): 支持两种修正模式——MOG2 背景建模 + 轮廓实心填充（`--diff`），或 YOLOv11x-seg 实例分割（`--yolo`），从基准帧（无人体）与起跳/落地帧的脚部 ROI 精确提取鞋子边缘位置，减少不同鞋子尺寸带来的误差
 - **犯规检测**: 踩线、垫步、单脚起跳、多人入界、出界、撑杆辅助
 - **鞋子边缘修正**: Canny + ROI 局部检测，补偿骨骼关键点在鞋底位置上的偏差
 - **批量处理**: 支持一次性跑多段视频并生成汇总 CSV
@@ -89,11 +89,16 @@ result/
         │   ├── takeoff.jpeg               # 起跳帧标注图
         │   ├── landed.jpeg                # 落地帧标注图
         │   ├── foul-*.jpeg                # 犯规截图
-        │   └── diff/
-        │       ├── diff-Stage1-baseframe.jpeg    # 基准帧（无人体）
-        │       ├── diff-Stage2-roi-takeoff.jpeg  # ROI 标注
-        │       ├── diff-Stage3-edge-takeoff.jpeg # MOG2 前景/轮廓填充过程
-        │       └── diff-Stage4-combined.jpeg     # 差分叠加结果
+        │   ├── diff/                       # MOG2 差分过程图
+        │   │   ├── diff-Stage1-baseframe.jpeg
+        │   │   ├── diff-Stage2-roi-*.jpeg
+        │   │   ├── diff-Stage3-edge-*.jpeg
+        │   │   └── diff-Stage4-*.jpeg
+        │   └── yolo/                        # YOLO seg 过程图
+        │       ├── yolo-Stage1-seg-*.jpeg        # 起跳/落地帧人体分割覆盖图
+        │       ├── yolo-Stage2-roi-*.jpeg        # ROI 标注
+        │       ├── yolo-Stage3-mask-*.jpeg       # YOLO Mask 切片
+        │       └── yolo-Stage4-*.jpeg            # 叠加结果
         └── logs/
             ├── run_<时间戳>.log         # 运行日志
             └── keypoints_<时间戳>.log   # 关键点帧数据
@@ -160,10 +165,12 @@ tiaoyuan/
       基准帧 + 落地帧 → MOG2 前景 → 二值化 → 轮廓填充 → 脚后跟 X
 ```
 
-**YOLOv11-seg 实例分割** (`--yolo`):
+**YOLOv11x-seg 实例分割** (`--yolo`):
 ```
-流程: 全图 YOLO 推理 → person 二值 Mask → 脚部关键点 ROI 裁剪 → 高度过滤(前40%置零) → 脚尖/脚跟 X
+流程: 全图 YOLO 推理(模型: yolo11x-seg.pt) → person 二值 Mask → 脚部关键点 ROI 裁剪 → 高度过滤(前40%置零) → 脚尖/脚跟 X
 ```
+
+> 也可使用其他尺寸模型（yolo11n/s/m/l/x-seg），在 [src/inference/diff_detector.py](src/inference/diff_detector.py) 中修改模型文件名即可。
 
 运行示例：
 ```bash

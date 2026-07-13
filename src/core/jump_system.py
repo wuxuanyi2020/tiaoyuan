@@ -49,6 +49,7 @@ class StandingLongJumpSystem:
         self.result_dir = config.result_dir
         self.images_dir = os.path.join(self.result_dir, "images") if self.result_dir else None
         self.images_diff_dir = os.path.join(self.result_dir, "images", "diff") if self.result_dir else None
+        self.images_yolo_dir = os.path.join(self.result_dir, "images", "yolo") if self.result_dir else None
         self.logs_dir = os.path.join(self.result_dir, "logs") if self.result_dir else None
 
         # 运行日志
@@ -613,32 +614,52 @@ class StandingLongJumpSystem:
         self._save_payload()
 
     def _save_diff_image(self):
-        """分步保存差分法各阶段过程照片到 images/diff/ 目录。
+        """分步保存差分/YOLO 各阶段过程照片。
 
-           输出文件名格式: diff-Stage{阶段}-{描述}.jpeg
+        传统差分 → images/diff/；YOLO seg → images/yolo/
         """
-        if not self.images_diff_dir or not self.diff_detector.has_base_frame:
-            return
-        os.makedirs(self.images_diff_dir, exist_ok=True)
-        stages = [
-            # (mode,                  suffix)
-            ("base",                  "Stage1-baseframe"),
-            ("roi_takeoff",           "Stage2-roi-takeoff"),
-            ("roi_landing",           "Stage2-roi-landing"),
-            ("diffmap_takeoff",       "Stage3-edge-takeoff"),
-            ("diffmap_landing",       "Stage3-edge-landing"),
-            ("takeoff",               "Stage4-takeoff"),
-            ("landing",               "Stage4-landing"),
-            ("combined",              "Stage4-combined"),
-        ]
+        if self.config.enable_seg:
+            target_dir = self.images_yolo_dir
+            if not target_dir:
+                return
+            os.makedirs(target_dir, exist_ok=True)
+            stages = [
+                ("base_takeoff",          "Stage1-seg-takeoff"),
+                ("base_landing",          "Stage1-seg-landing"),
+                ("roi_takeoff",           "Stage2-roi-takeoff"),
+                ("roi_landing",           "Stage2-roi-landing"),
+                ("mask_takeoff",          "Stage3-mask-takeoff"),
+                ("mask_landing",          "Stage3-mask-landing"),
+                ("takeoff",               "Stage4-takeoff"),
+                ("landing",               "Stage4-landing"),
+                ("combined",              "Stage4-combined"),
+            ]
+            prefix = "yolo"
+        else:
+            if not self.images_diff_dir or not self.diff_detector.has_base_frame:
+                return
+            target_dir = self.images_diff_dir
+            os.makedirs(target_dir, exist_ok=True)
+            stages = [
+                ("base",                  "Stage1-baseframe"),
+                ("roi_takeoff",           "Stage2-roi-takeoff"),
+                ("roi_landing",           "Stage2-roi-landing"),
+                ("diffmap_takeoff",       "Stage3-edge-takeoff"),
+                ("diffmap_landing",       "Stage3-edge-landing"),
+                ("takeoff",               "Stage4-takeoff"),
+                ("landing",               "Stage4-landing"),
+                ("combined",              "Stage4-combined"),
+            ]
+            prefix = "diff"
+
         for mode, suffix in stages:
             img = self.diff_detector.render_result_image(mode=mode)
             if img is None:
-                self._log("DIFF", f"差分照片[{suffix}] 生成失败，跳过")
+                self._log("DIFF", f"{prefix}照片[{suffix}] 生成失败，跳过")
                 continue
-            filename = os.path.join(self.images_diff_dir, f"diff-{suffix}.jpeg")
+            filename = os.path.join(target_dir, f"{prefix}-{suffix}.jpeg")
             imwrite_safe(filename, img)
-        self._log("SAVE", "差分各阶段照片已保存: Stage1~Stage4")
+        self._log("SAVE", f"{prefix.upper()}各阶段照片已保存: {target_dir}")
 
     # ---------- 显示合成 ----------
     def _compose_display(self, frame, display_img, kpts):
@@ -815,14 +836,14 @@ class StandingLongJumpSystem:
                         heel_l_xy = heel_r_xy = heel_l_cm = heel_r_cm = None
                     self._handle_jumping_skeleton(frame_idx, heel_l_xy, heel_r_xy, heel_l_cm, heel_r_cm)
                     # 差分法：落地后保存落地帧（从主循环中调用，frame/kpts 有效）
-                    if self.state == "LANDED" and self.diff_detector.has_base_frame:
+                    if self.state == "LANDED" and (self.config.enable_seg or self.diff_detector.has_base_frame):
                         self.diff_detector.save_landing_frame(frame, kpts)
 
                 if self.calibrator.calibrated:
                     self._recalc_results_with_current_mat()
 
                 # ── 差分法：落地后计算差分距离 ──
-                if self.state == "LANDED" and not self._diff_computed and self.diff_detector.has_base_frame:
+                if self.state == "LANDED" and not self._diff_computed and (self.config.enable_seg or self.diff_detector.has_base_frame):
                     self._diff_computed = True
                     to_x, ld_x, dist = self.diff_detector.compute_combined_distance()
                     if to_x is not None and ld_x is not None:

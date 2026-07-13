@@ -81,8 +81,8 @@ class DiffDetector:
         self.seg_model = None
         if self.enable_seg:
             from ultralytics import YOLO
-            self.seg_model = YOLO("yolo11n-seg.pt")
-            print("[DIFF] YOLOv11-seg 实例分割已启用 (模型: yolo11n-seg.pt)")
+            self.seg_model = YOLO("yolo11x-seg.pt")
+            print("[DIFF] YOLOv11-seg 实例分割已启用 (模型: yolo11x-seg.pt)")
 
         # ── 全帧差分二值 Mask（供可视化） ──
         self.takeoff_diff_mask = None
@@ -364,7 +364,7 @@ class DiffDetector:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def compute_takeoff(self):
-        if not self._base_frame_captured:
+        if not self.enable_seg and not self._base_frame_captured:
             return None
         try:
             frame = getattr(self, "_takeoff_frame", None)
@@ -378,7 +378,7 @@ class DiffDetector:
             return None
 
     def compute_landing(self):
-        if not self._base_frame_captured:
+        if not self.enable_seg and not self._base_frame_captured:
             return None
         try:
             frame = getattr(self, "_landing_frame", None)
@@ -440,15 +440,90 @@ class DiffDetector:
         return vis
 
     def _render_edge_diff_view(self, which):
-        """Stage3-MOG2: RawBase | RawCurrent | MOG2_FG | SolidMask 四列。"""
+        """Stage3 可视化：根据 self.enable_seg 显示不同内容。
+
+        YOLO 模式: RawCurrent | YOLO_ROI_Mask | FinalMask（三列）
+        MOG2 模式: RawBase | RawCurrent | MOG2_FG | SolidMask（四列，原有逻辑）
+        """
         frame, kpts, label = self._get_frame_kpts(which)
         if frame is None or kpts is None:
             return None
 
         edge_side = "toe" if which == "takeoff" else "heel"
         foot_configs = self._get_foot_configs(edge_side)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h_img, w_img = frame.shape[:2]
 
+        # ── YOLO 模式：无 MOG2 ──
+        if self.enable_seg:
+            # 全图 YOLO 推理一次
+            results = self.seg_model(frame, classes=[0], conf=0.3, verbose=False)
+            full_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+            if len(results) > 0 and results[0].masks is not None:
+                for mask_xy in results[0].masks.xy:
+                    pts = np.array([mask_xy], dtype=np.int32)
+                    cv2.fillPoly(full_mask, [pts], 255)
+
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            strips = []
+            for cfg in foot_configs:
+                is_left = (cfg["label"] == "left")
+                roi_result = self._foot_roi_gray(
+                    frame_gray, kpts, cfg["indices"],
+                    is_left=is_left, shrink_inward=0.3)
+                if roi_result is None:
+                    continue
+                _, (x1, y1) = roi_result
+                h_roi, w_roi = roi_result[0].shape
+
+                # 列1: 原始BGR ROI
+                col_raw = frame[y1:y1 + h_roi, x1:x1 + w_roi]
+                # 列2: 未经高度过滤的 YOLO Mask 交集
+                raw_mask = full_mask[y1:y1 + h_roi, x1:x1 + w_roi].copy()
+                # 列3: 经过 40% 高度过滤的最终 Mask
+                final_mask = raw_mask.copy()
+                final_mask[0:int(h_roi * 0.4), :] = 0
+
+                target_h = 160
+                def _r(img):
+                    s = target_h / img.shape[0]
+                    nw = max(1, int(img.shape[1] * s))
+                    if len(img.shape) == 2:
+                        return cv2.resize(img, (nw, target_h), interpolation=cv2.INTER_AREA)
+                    return cv2.resize(img, (nw, target_h), interpolation=cv2.INTER_AREA)
+
+                col_raw_r = _r(col_raw)
+                col_mask_r = cv2.cvtColor(_r(raw_mask), cv2.COLOR_GRAY2BGR)
+                col_final_r = cv2.cvtColor(_r(final_mask), cv2.COLOR_GRAY2BGR)
+
+                tag_h = 28
+                for cimg, t in [(col_raw_r, "RawCurrent"),
+                                (col_mask_r, "YOLO_ROI_Mask"),
+                                (col_final_r, "FinalMask")]:
+                    tb = np.zeros((tag_h, cimg.shape[1], 3), dtype=np.uint8)
+                    cv2.putText(tb, t, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    cimg[:] = np.vstack([tb, cimg])[:cimg.shape[0]]
+
+                strip = cv2.hconcat([col_raw_r, col_mask_r, col_final_r])
+                cv2.putText(strip, cfg["label"], (8, tag_h + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 255, 0) if is_left else (0, 255, 255), 2)
+                strips.append(strip)
+
+            if not strips:
+                return None
+
+            collage = cv2.vconcat(strips)
+            title_h = 50
+            canvas = np.zeros((title_h + collage.shape[0], collage.shape[1], 3), dtype=np.uint8)
+            canvas[title_h:, :collage.shape[1]] = collage
+            canvas = self._put_text_cn(
+                canvas,
+                f"Stage3 - YOLO ({label}): 原图ROI → YOLO人体Mask交集 → 高度过滤后Mask",
+                (20, 6), (255, 255, 255), size=22)
+            return canvas
+
+        # ── MOG2 模式：原有逻辑 ──
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         strips = []
         for cfg in foot_configs:
             is_left = (cfg["label"] == "left")
@@ -462,15 +537,13 @@ class DiffDetector:
             if base_roi.shape != roi_current.shape:
                 continue
 
-            # MOG2 提取（用于可视化中间结果）
+            # MOG2 提取
             bg_sub = cv2.createBackgroundSubtractorMOG2(
                 history=2, varThreshold=20, detectShadows=True)
             bg_sub.apply(base_roi)
             fg_mask = bg_sub.apply(roi_current)
-            # 增强对比度便于观察
             fg_vis = cv2.normalize(fg_mask, None, 0, 255, cv2.NORM_MINMAX)
 
-            # 最终的实心填充 Mask
             mask_result = self._foot_diff_mask(
                 frame, kpts, cfg["indices"],
                 is_left=is_left, shrink_inward=0.3,
@@ -478,7 +551,6 @@ class DiffDetector:
             binary = mask_result[0] if mask_result is not None else np.zeros_like(roi_current)
 
             target_h = 160
-
             def _r(img):
                 s = target_h / img.shape[0]
                 return cv2.resize(img, (max(1, int(img.shape[1] * s)), target_h),
@@ -515,12 +587,45 @@ class DiffDetector:
             (20, 6), (255, 255, 255), size=22)
         return canvas
 
-    def render_result_image(self, mode="combined"):
-        if self._base_frame_raw is None:
+    def _render_seg_overlay(self, which):
+        """绘制 YOLO 人体实例分割结果覆盖图（Stage1）。"""
+        if which == "takeoff":
+            frame = getattr(self, "_takeoff_frame", None)
+        else:
+            frame = getattr(self, "_landing_frame", None)
+        if frame is None:
             return None
+        h, w = frame.shape[:2]
 
-        # ── 阶段①：基准帧 ──
+        results = self.seg_model(frame, classes=[0], conf=0.3, verbose=False)
+        full_mask = np.zeros((h, w), dtype=np.uint8)
+        if len(results) > 0 and results[0].masks is not None:
+            for mask_xy in results[0].masks.xy:
+                pts = np.array([mask_xy], dtype=np.int32)
+                cv2.fillPoly(full_mask, [pts], 255)
+
+        # 原图 + 半透明 Mask 叠加
+        overlay = frame.copy()
+        overlay[full_mask > 0] = overlay[full_mask > 0] * 0.5 + np.array([0, 200, 0], dtype=np.uint8) * 0.5
+        overlay = overlay.astype(np.uint8)
+
+        label = "起跳帧" if which == "takeoff" else "落地帧"
+        overlay = self._put_text_cn(overlay, f"Stage1 - YOLO 人体实例分割 ({label})",
+                                    (20, 8), (255, 255, 255), size=26)
+        return overlay
+
+    def render_result_image(self, mode="combined"):
+        """渲染各阶段结果图。MOG2 模式依赖基准帧，YOLO 模式使用起跳/落地帧。"""
+
+        # ── 阶段①：YOLO 人体分割或 MOG2 基准帧 ──
+        if mode in ("base_takeoff", "base_landing"):
+            if self.enable_seg:
+                which = mode.split("_")[1]
+                return self._render_seg_overlay(which)
+            return None
         if mode == "base":
+            if self._base_frame_raw is None:
+                return None
             vis = self._base_frame_raw.copy()
             vis = self._put_text_cn(vis, "Stage1 - Base Frame (垫子标定范围无人)",
                                     (20, 8), (255, 255, 255), size=26)
@@ -531,14 +636,30 @@ class DiffDetector:
             which = mode.split("_")[1]
             return self._render_roi_view(which)
 
-        # ── 阶段③：边缘差分（统一四列视图） ──
+        # ── 阶段③：边缘差分 / YOLO Mask 切片 ──
         if mode in ("diffmap_takeoff", "diffmap_landing",
                      "mask_takeoff", "mask_landing"):
             which = mode.split("_")[1]
             return self._render_edge_diff_view(which)
 
         # ── 阶段④：叠加结果 ──
-        vis = self._base_frame_raw.copy()
+        if self.enable_seg:
+            frame = None
+            if mode in ("takeoff", "combined"):
+                frame = getattr(self, "_takeoff_frame", None)
+            elif mode == "landing":
+                frame = getattr(self, "_landing_frame", None)
+            # combined 模式优先使用起跳帧
+            if frame is None:
+                frame = getattr(self, "_takeoff_frame",
+                                getattr(self, "_landing_frame", None))
+            if frame is None:
+                return None
+            vis = frame.copy()
+        else:
+            if self._base_frame_raw is None:
+                return None
+            vis = self._base_frame_raw.copy()
         overlay = np.zeros_like(vis, dtype=np.uint8)
 
         if mode in ("takeoff", "combined") and self.takeoff_diff_mask is not None:
@@ -567,10 +688,11 @@ class DiffDetector:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         y_offset = 8
+        prefix = "Stage4 - YOLO" if self.enable_seg else "Stage4 - MOG2"
         title_map = {
-            "takeoff":  "Stage4 - 起跳边缘差分(红)",
-            "landing":  "Stage4 - 落地边缘差分(蓝)",
-            "combined": "Stage4 - 边缘差分叠加(红+蓝=紫)",
+            "takeoff":  f"{prefix}起跳(红)",
+            "landing":  f"{prefix}落地(蓝)",
+            "combined": f"{prefix}叠加(红+蓝=紫)",
         }
         vis = self._put_text_cn(vis, title_map.get(mode, ""), (20, y_offset),
                                 (255, 255, 255), size=26)
