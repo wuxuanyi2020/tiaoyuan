@@ -24,6 +24,8 @@ class JumpConfig:
     result_dir: str | None = None  # 结果输出根目录，由 main 在运行时传入
     enable_foul_detection: bool = True
     landing_offset_cm: float = -5.0  # 落地点修正（鞋跟厚度补偿）
+    enable_diff: bool = True  # 启用差分法距离修正（默认开启）
+    enable_mat_output: bool = False  # 输出垫子识别图 (mat_mask_quad/hsv)
     debug: bool = False  # 调试模式：起跳/落地时输出触发条件到日志
 
 

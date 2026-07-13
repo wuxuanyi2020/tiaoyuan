@@ -11,6 +11,7 @@ from src.config import JumpConfig
 from src.rules.foul_detection import FoulDetector
 from src.inference.mat_calibration import MatCalibrator
 from src.inference.shoe_detector import ShoeEdgeDetector
+from src.inference.diff_detector import DiffDetector
 from src.inference.pose_estimator import PoseEstimator
 from src.visualization.rendering import Renderer, imwrite_safe
 
@@ -25,6 +26,7 @@ class StandingLongJumpSystem:
             manual_mode=config.manual_calib,
         )
         self.shoe_detector = ShoeEdgeDetector(self.calibrator)
+        self.diff_detector = DiffDetector(self.calibrator)
         self.kpt_idx = {
             "l_hip": 23, "r_hip": 24,
             "l_ankle": 27, "r_ankle": 28,
@@ -46,6 +48,7 @@ class StandingLongJumpSystem:
         # --- 结果目录 & 日志 ---
         self.result_dir = config.result_dir
         self.images_dir = os.path.join(self.result_dir, "images") if self.result_dir else None
+        self.images_diff_dir = os.path.join(self.result_dir, "images", "diff") if self.result_dir else None
         self.logs_dir = os.path.join(self.result_dir, "logs") if self.result_dir else None
 
         # 运行日志
@@ -107,6 +110,9 @@ class StandingLongJumpSystem:
         self._landed_saved = False
         self._foul_saved = False
         self.record_writer = None
+
+        # ── 差分法状态变量 ──
+        self._diff_computed = False
 
         self.takeoff_display_offset_cm = float(config.takeoff_offset_cm)
         self.landing_offset_cm = float(config.landing_offset_cm)
@@ -207,6 +213,7 @@ class StandingLongJumpSystem:
         self._landed_saved = False
         self._foul_saved = False
         self.foul_detector.reset()
+        self._diff_computed = False
         self.calibrator.mat_locked = True
 
     def _ensure_record_writer(self, display_img):
@@ -450,6 +457,10 @@ class StandingLongJumpSystem:
         self.takeoff_x_cm = takeoff_x + self.takeoff_display_offset_cm
         self._save_takeoff_image(takeoff_img if takeoff_img is not None else frame, takeoff_kpts, takeoff_all_kpts)
         self._takeoff_frame_img = takeoff_img.copy() if takeoff_img is not None else None
+        # 差分法：保存起跳帧
+        if self.diff_detector.has_base_frame:
+            takeoff_frame_save = takeoff_img if takeoff_img is not None else frame
+            self.diff_detector.save_takeoff_frame(takeoff_frame_save, takeoff_kpts)
 
     def _handle_jumping_skeleton(self, frame_idx, heel_l_xy, heel_r_xy, heel_l_cm, heel_r_cm):
         self._skeleton_jump_counter += 1
@@ -556,8 +567,7 @@ class StandingLongJumpSystem:
         img = self.renderer.put_text_chinese(img, takeoff_text, (50, 140), (255, 255, 0), size=30)
         if self.foul_detector.reason:
             img = self.renderer.put_text_chinese(img, f"犯规: {self.foul_detector.reason}", (50, 200), (0, 0, 255), size=40)
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = os.path.join(self.images_dir, f"takeoff-{ts}.jpeg")
+        filename = os.path.join(self.images_dir, "takeoff.jpeg")
         imwrite_safe(filename, img)
         self._log("SAVE", f"起跳图片已保存: {filename}")
         self._takeoff_saved = True
@@ -596,12 +606,39 @@ class StandingLongJumpSystem:
         if self.foul_detector.reason:
             img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, 230), (0, 0, 255), size=50)
 
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = os.path.join(self.images_dir, f"landed-{ts}.jpeg") if self.images_dir else f"landed-{ts}.jpeg"
+        filename = os.path.join(self.images_dir, "landed.jpeg")
         imwrite_safe(filename, img)
         self._log("SAVE", f"落地图片已保存: {filename}")
         self._landed_saved = True
         self._save_payload()
+
+    def _save_diff_image(self):
+        """分步保存差分法各阶段过程照片到 images/diff/ 目录。
+
+           输出文件名格式: diff-Stage{阶段}-{描述}.jpeg
+        """
+        if not self.images_diff_dir or not self.diff_detector.has_base_frame:
+            return
+        os.makedirs(self.images_diff_dir, exist_ok=True)
+        stages = [
+            # (mode,                  suffix)
+            ("base",                  "Stage1-baseframe"),
+            ("roi_takeoff",           "Stage2-roi-takeoff"),
+            ("roi_landing",           "Stage2-roi-landing"),
+            ("diffmap_takeoff",       "Stage3-edge-takeoff"),
+            ("diffmap_landing",       "Stage3-edge-landing"),
+            ("takeoff",               "Stage4-takeoff"),
+            ("landing",               "Stage4-landing"),
+            ("combined",              "Stage4-combined"),
+        ]
+        for mode, suffix in stages:
+            img = self.diff_detector.render_result_image(mode=mode)
+            if img is None:
+                self._log("DIFF", f"差分照片[{suffix}] 生成失败，跳过")
+                continue
+            filename = os.path.join(self.images_diff_dir, f"diff-{suffix}.jpeg")
+            imwrite_safe(filename, img)
+        self._log("SAVE", "差分各阶段照片已保存: Stage1~Stage4")
 
     # ---------- 显示合成 ----------
     def _compose_display(self, frame, display_img, kpts):
@@ -696,8 +733,8 @@ class StandingLongJumpSystem:
                         frame_idx = 0
                         self._log("CALIB", f"标定完成，帧计数器重置为0")
                     self._log("CALIB", "垫子标定完成")
-                    # 保存两张垫子识别图
-                    if self.images_dir:
+                    # 保存两张垫子识别图（默认不输出）
+                    if self.config.enable_mat_output and self.images_dir:
                         mask_quad = self.calibrator.render_mask(frame)
                         if mask_quad is not None:
                             imwrite_safe(os.path.join(self.images_dir, "mat_mask_quad.jpeg"), cv2.cvtColor(mask_quad, cv2.COLOR_GRAY2BGR))
@@ -705,6 +742,22 @@ class StandingLongJumpSystem:
                         if mask_hsv is not None:
                             imwrite_safe(os.path.join(self.images_dir, "mat_mask_hsv.jpeg"), cv2.cvtColor(mask_hsv, cv2.COLOR_GRAY2BGR))
                         self._log("CALIB", "垫子识别图已保存: mat_mask_quad.jpeg (四边形拟合), mat_mask_hsv.jpeg (HSV原始)")
+
+                # ── 差分法：基准帧捕获（垫子上无人时） ──
+                if (self.config.enable_diff
+                        and self.calibrator.calibrated
+                        and not self.diff_detector.has_base_frame
+                        and self.state == "IDLE"):
+                    has_person_in_mat = False
+                    if kpts is not None:
+                        ankles = self._get_feet(kpts, "ankle")
+                        ankle_xy = self._avg_points(ankles)
+                        ankle_cm = self.calibrator.transform_to_mat_cm(ankle_xy)
+                        if ankle_cm is not None and self.calibrator.in_mat(ankle_cm):
+                            has_person_in_mat = True
+                    if not has_person_in_mat:
+                        self.diff_detector.capture_base_frame(frame)
+                        self._log("DIFF", f"基准帧已捕获（帧{frame_idx}，垫子标定范围无人体关键点）")
 
                 # 保存上一帧骨架数据（供犯规检测使用）
                 if kpts is not None:
@@ -761,9 +814,24 @@ class StandingLongJumpSystem:
                     else:
                         heel_l_xy = heel_r_xy = heel_l_cm = heel_r_cm = None
                     self._handle_jumping_skeleton(frame_idx, heel_l_xy, heel_r_xy, heel_l_cm, heel_r_cm)
+                    # 差分法：落地后保存落地帧（从主循环中调用，frame/kpts 有效）
+                    if self.state == "LANDED" and self.diff_detector.has_base_frame:
+                        self.diff_detector.save_landing_frame(frame, kpts)
 
                 if self.calibrator.calibrated:
                     self._recalc_results_with_current_mat()
+
+                # ── 差分法：落地后计算差分距离 ──
+                if self.state == "LANDED" and not self._diff_computed and self.diff_detector.has_base_frame:
+                    self._diff_computed = True
+                    to_x, ld_x, dist = self.diff_detector.compute_combined_distance()
+                    if to_x is not None and ld_x is not None:
+                        self._log("DIFF",
+                                  f"差分法结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, "
+                                  f"距离={dist:.1f}cm")
+                        self._save_diff_image()
+                    else:
+                        self._log("DIFF", "差分法计算失败（关键点或基准帧不足）")
 
                 self._save_landed_image(frame, kpts)
                 if self.state == "LANDED" and not self.config.display:
