@@ -37,3 +37,10 @@ ultralytics-*/
 
 # 凭据
 github_token.txt
+
+# 外部依赖/备份
+HomoFormer-master/
+backup/
+
+# 基准测试脚本
+benchmark_yolo.py

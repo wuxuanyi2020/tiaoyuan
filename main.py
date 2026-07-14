@@ -27,21 +27,22 @@ def build_parser():
     parser.add_argument("--backend", type=str, default="mediapipe")
     parser.add_argument("--debug-dir", type=str, default=None)
     parser.add_argument("--record", type=str, default=None, help="录制输出视频路径")
-    parser.add_argument("--mat-length-cm", type=float, default=340.0)
-    parser.add_argument("--mat-width-cm", type=float, default=90.0)
+    parser.add_argument("--mat-length-cm", type=float, default=338.0)
+    parser.add_argument("--mat-width-cm", type=float, default=100.0)
     parser.add_argument("--trigger-move-cm", type=float, default=30.0)
     parser.add_argument("--trigger-frames", type=int, default=2)
     parser.add_argument("--min-flight-frames", type=int, default=5)
     parser.add_argument("--max-jump-frames", type=int, default=120)
-    parser.add_argument("--takeoff-line-cm", type=float, default=32.0)
-    parser.add_argument("--takeoff-offset-cm", type=float, default=0.0)
+    parser.add_argument("--takeoff-line-cm", type=float, default=31.0)
+    parser.add_argument("--takeoff-offset-cm", type=float, default=3.0)
     parser.add_argument("--manual-calib", action="store_true", help="手动四点标定（需鼠标点击）")
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
     parser.add_argument("--landing-offset-cm", type=float, default=-5.0,
                         help="落地点修正值(cm)，补偿鞋后跟厚度，默认-5.0（负值缩短距离）")
     parser.add_argument("--debug", action="store_true", help="调试模式：输出起跳/落地触发条件到日志")
     parser.add_argument("--diff", action="store_true", help="启用 MOG2 背景差分法距离修正（默认关闭）")
-    parser.add_argument("--yolo", action="store_true", help="启用 YOLOv11-seg 实例分割距离修正（默认关闭）")
+    parser.add_argument("--yolo", nargs=2, metavar=("VERSION", "SCALE"),
+                        help="启用 YOLO 实例分割距离修正，指定版本和尺度，如 --yolo 26 x（版本: 8/11/26, 尺度: n/s/m/l/x）")
     parser.add_argument("--enable-mat-output", action="store_true", help="输出垫子识别图 (mat_mask_quad/hsv)")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
@@ -79,11 +80,13 @@ def run_single(video_path, args):
             result_dir=result_dir,
             enable_foul_detection=not args.no_foul_detection,
             landing_offset_cm=args.landing_offset_cm,
-            enable_diff=args.diff or args.yolo,
+            enable_diff=args.diff or bool(args.yolo),
             enable_mat_output=args.enable_mat_output,
-            enable_seg=args.yolo,
-            debug=args.debug,
-        )
+            enable_seg=bool(args.yolo),
+        yolo_version=args.yolo[0] if args.yolo else "11",
+        yolo_scale=args.yolo[1] if args.yolo else "x",
+        debug=args.debug,
+    )
     StandingLongJumpSystem(config).run()
 
     # 读取结果
@@ -95,15 +98,28 @@ def run_single(video_path, args):
 
     dist_val = result.get("distance_cm")
     dist_str = f"{dist_val:>6.1f}" if isinstance(dist_val, (int, float)) else "  N/A  "
+    yolo_time = result.get("yolo_infer_time_s", None)
+    time_str = f" | yolo用时={yolo_time:.3f}s" if yolo_time is not None else ""
     print(f"<< 完成: {video_name} | 距离={dist_str} cm "
           f"| 有效={result.get('valid', 'N/A')} "
-          f"| 犯规={result.get('foul_reason', '无')}")
+          f"| 犯规={result.get('foul_reason', '无')}"
+          f"{time_str}")
     print("=" * 60)
     return result
 
 
 def main():
     args = build_parser().parse_args()
+
+    # 校验 --yolo 参数
+    if args.yolo:
+        ver, scale = args.yolo
+        valid_vers = {"8", "11", "26"}
+        valid_scales = {"n", "s", "m", "l", "x"}
+        if ver not in valid_vers or scale not in valid_scales:
+            print(f"错误: --yolo 版本必须是 {valid_vers}，尺度必须是 {valid_scales}，"
+                  f"收到 '{ver} {scale}'")
+            sys.exit(1)
 
     # ── 批量模式 ──
     if args.batch or args.videos:
@@ -185,9 +201,11 @@ def main():
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
-        enable_diff=args.diff or args.yolo,
+        enable_diff=args.diff or bool(args.yolo),
         enable_mat_output=args.enable_mat_output,
-        enable_seg=args.yolo,
+        enable_seg=bool(args.yolo),
+        yolo_version=args.yolo[0] if args.yolo else "11",
+        yolo_scale=args.yolo[1] if args.yolo else "x",
         debug=args.debug,
     )
     StandingLongJumpSystem(config).run()

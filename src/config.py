@@ -27,6 +27,8 @@ class JumpConfig:
     enable_diff: bool = False  # 启用差分法距离修正（默认关闭）
     enable_mat_output: bool = False  # 输出垫子识别图 (mat_mask_quad/hsv)
     enable_seg: bool = False  # 是否启用 YOLOv11-seg 实例分割替代背景差分
+    yolo_version: str = "11"  # YOLO 版本号: "8", "11", "26" 等
+    yolo_scale: str = "x"     # YOLO 模型尺度: "n", "s", "m", "l", "x"
     debug: bool = False  # 调试模式：起跳/落地时输出触发条件到日志
 
 

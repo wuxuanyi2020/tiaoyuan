@@ -15,9 +15,14 @@
 
 与骨骼关键点法解耦，不影响起跳/落地的判断逻辑。
 """
+import os
+import time
+
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+YOLO_MODEL_DIR = r"E:\1-8体测项目\tiaoyuan\yolo_model"
 
 
 class DiffDetector:
@@ -68,9 +73,11 @@ class DiffDetector:
         draw.text(pos, text, font=font, fill=color[::-1])
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-    def __init__(self, calibrator, enable_seg=False):
+    def __init__(self, calibrator, enable_seg=False, yolo_version="11", yolo_scale="x"):
         self._calib = calibrator
         self.enable_seg = enable_seg
+        self.yolo_version = yolo_version
+        self.yolo_scale = yolo_scale
 
         # ── 基准帧 ──
         self._base_frame_raw = None
@@ -79,10 +86,17 @@ class DiffDetector:
 
         # ── YOLO 实例分割模型 ──
         self.seg_model = None
+        self.yolo_total_time = 0.0  # 累计 YOLO 推理时间（秒）
+        self.yolo_model_label = ""
         if self.enable_seg:
             from ultralytics import YOLO
-            self.seg_model = YOLO("yolo11x-seg.pt")
-            print("[DIFF] YOLOv11-seg 实例分割已启用 (模型: yolo11x-seg.pt)")
+            # YOLOv8 前缀为 "yolov"，v11/v26 前缀为 "yolo"
+            v_prefix = "yolov" if self.yolo_version == "8" else "yolo"
+            model_name = f"{v_prefix}{self.yolo_version}{self.yolo_scale}-seg.pt"
+            self.yolo_model_label = f"YOLO{self.yolo_version}{self.yolo_scale}"
+            model_path = os.path.join(YOLO_MODEL_DIR, model_name)
+            self.seg_model = YOLO(model_path)
+            print(f"[DIFF] {self.yolo_model_label}-seg 实例分割已启用 (模型: {model_path})")
 
         # ── 全帧差分二值 Mask（供可视化） ──
         self.takeoff_diff_mask = None
@@ -204,11 +218,13 @@ class DiffDetector:
         返回:
             (binary_mask, origin_xy) 或 None
         """
-        # ── YOLOv11-seg 路径：先在全图上推理，再按 ROI 裁剪 ──
+        # ── YOLO-seg 路径：先在全图上推理，再按 ROI 裁剪 ──
         if self.enable_seg:
             img_h, img_w = frame_bgr.shape[:2]
-            # 全图推理：只筛选 person 类
+            # 全图推理：只筛选 person 类（带计时）
+            _t0 = time.perf_counter()
             results = self.seg_model(frame_bgr, classes=[0], conf=0.3, verbose=False)
+            self.yolo_total_time += time.perf_counter() - _t0
 
             # 在全图尺寸上构建二值人体 Mask
             full_mask = np.zeros((img_h, img_w), dtype=np.uint8)
@@ -371,8 +387,12 @@ class DiffDetector:
             kpts = getattr(self, "_takeoff_kpts", None)
             if frame is None or kpts is None:
                 return None
+            _t0 = time.perf_counter()
             x_cm = self._compute_shoe_extreme(frame, kpts, "toe")
+            elapsed = time.perf_counter() - _t0
             self.takeoff_shoe_x_cm = x_cm
+            if self.enable_seg:
+                print(f"[YOLO] [{self.yolo_model_label}] 起跳帧推理用时: {elapsed:.3f}s")
             return x_cm
         except Exception:
             return None
@@ -385,8 +405,12 @@ class DiffDetector:
             kpts = getattr(self, "_landing_kpts", None)
             if frame is None or kpts is None:
                 return None
+            _t0 = time.perf_counter()
             x_cm = self._compute_shoe_extreme(frame, kpts, "heel")
+            elapsed = time.perf_counter() - _t0
             self.landing_shoe_x_cm = x_cm
+            if self.enable_seg:
+                print(f"[YOLO] [{self.yolo_model_label}] 落地帧推理用时: {elapsed:.3f}s")
             return x_cm
         except Exception:
             return None

@@ -26,7 +26,9 @@ class StandingLongJumpSystem:
             manual_mode=config.manual_calib,
         )
         self.shoe_detector = ShoeEdgeDetector(self.calibrator)
-        self.diff_detector = DiffDetector(self.calibrator, enable_seg=config.enable_seg)
+        self.diff_detector = DiffDetector(self.calibrator, enable_seg=config.enable_seg,
+                                          yolo_version=config.yolo_version,
+                                          yolo_scale=config.yolo_scale)
         self.kpt_idx = {
             "l_hip": 23, "r_hip": 24,
             "l_ankle": 27, "r_ankle": 28,
@@ -240,6 +242,7 @@ class StandingLongJumpSystem:
             "distance_cm": float(self.final_distance_cm or 0.0),
             "takeoff_x_cm": float(self.takeoff_x_cm or 0.0),
             "landing_x_cm": float(self.landing_x_cm or 0.0) if self.landing_x_cm is not None else None,
+            "yolo_infer_time_s": round(self.diff_detector.yolo_total_time, 3),
         }
         save_path = os.path.join(self.result_dir, "result.json") if self.result_dir else self.config.save_path
         with open(save_path, "w", encoding="utf-8") as f:
@@ -372,7 +375,7 @@ class StandingLongJumpSystem:
 
         hip_moved = (hip_cm[0] - self._skeleton_baseline_hip_x) if (hip_cm and self._skeleton_baseline_hip_x) else 0
         ankle_lifted_px = (self._skeleton_baseline_ankle_y - curr_ankle_y_px) if self._skeleton_baseline_ankle_y else 0
-        ankle_lifted = ankle_lifted_px > 20.0
+        ankle_lifted = ankle_lifted_px > 25.0
 
         is_taking_off = False
         takeoff_reason = ""
@@ -387,10 +390,11 @@ class StandingLongJumpSystem:
             takeoff_reason = f"toe_moved={toe_moved:.1f} > max(trigger_move_cm={self.config.trigger_move_cm}, 30.0)"
         elif hip_moved > 35.0 and toe_moved > 10.0:
             is_taking_off = True
-            takeoff_reason = f"hip_moved={hip_moved:.1f}>35.0 and toe_moved={toe_moved:.1f}>4.0"
-        elif ankle_lifted and toe_moved > 3.0 and self._skeleton_ready_stable == 0:
+            takeoff_reason = f"hip_moved={hip_moved:.1f}>35.0 and toe_moved={toe_moved:.1f}>10.0"
+        # 结合脚踝抬高、重心前冲，以及离地腾空时脚尖特有的"爆发性突变回缩"，过滤蓄力大动作
+        elif ankle_lifted and (toe_moved > 3.0 or (hip_moved > 70.0 and toe_moved < -2.0)):
             is_taking_off = True
-            takeoff_reason = f"ankle_lifted={ankle_lifted_px:.1f}px>20.0px and toe_moved={toe_moved:.1f}>3.0 and stable=0"
+            takeoff_reason = f"检测到离地爆发：ankle_lifted={ankle_lifted_px:.1f}px，重心前冲(hip_moved={hip_moved:.1f}>70) 且 脚尖腾空回缩(toe_moved={toe_moved:.1f}<-2.0)"
 
         trigger_count = self._skeleton_jump_trigger_counter
         stable_gate_passed = self._skeleton_ready_stable >= 10 or stable_reset_after_ready
@@ -753,16 +757,16 @@ class StandingLongJumpSystem:
                         _was_calibrated = True
                         frame_idx = 0
                         self._log("CALIB", f"标定完成，帧计数器重置为0")
-                    self._log("CALIB", "垫子标定完成")
-                    # 保存两张垫子识别图（默认不输出）
-                    if self.config.enable_mat_output and self.images_dir:
-                        mask_quad = self.calibrator.render_mask(frame)
-                        if mask_quad is not None:
-                            imwrite_safe(os.path.join(self.images_dir, "mat_mask_quad.jpeg"), cv2.cvtColor(mask_quad, cv2.COLOR_GRAY2BGR))
-                        mask_hsv = self.calibrator.render_hsv_mask(frame)
-                        if mask_hsv is not None:
-                            imwrite_safe(os.path.join(self.images_dir, "mat_mask_hsv.jpeg"), cv2.cvtColor(mask_hsv, cv2.COLOR_GRAY2BGR))
-                        self._log("CALIB", "垫子识别图已保存: mat_mask_quad.jpeg (四边形拟合), mat_mask_hsv.jpeg (HSV原始)")
+                        self._log("CALIB", "垫子标定完成")
+                        # 保存两张垫子识别图（默认不输出）
+                        if self.config.enable_mat_output and self.images_dir:
+                            mask_quad = self.calibrator.render_mask(frame)
+                            if mask_quad is not None:
+                                imwrite_safe(os.path.join(self.images_dir, "mat_mask_quad.jpeg"), cv2.cvtColor(mask_quad, cv2.COLOR_GRAY2BGR))
+                            mask_hsv = self.calibrator.render_hsv_mask(frame)
+                            if mask_hsv is not None:
+                                imwrite_safe(os.path.join(self.images_dir, "mat_mask_hsv.jpeg"), cv2.cvtColor(mask_hsv, cv2.COLOR_GRAY2BGR))
+                            self._log("CALIB", "垫子识别图已保存: mat_mask_quad.jpeg (四边形拟合), mat_mask_hsv.jpeg (HSV原始)")
 
                 # ── 差分法：基准帧捕获（垫子上无人时） ──
                 if (self.config.enable_diff
@@ -850,6 +854,10 @@ class StandingLongJumpSystem:
                         self._log("DIFF",
                                   f"差分法结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, "
                                   f"距离={dist:.1f}cm")
+                        if self.config.enable_seg:
+                            self._log("YOLO_TIME",
+                                      f"[{self.diff_detector.yolo_model_label}] "
+                                      f"YOLO 实例分割总用时: {self.diff_detector.yolo_total_time:.3f}s")
                         self._save_diff_image()
                     else:
                         self._log("DIFF", "差分法计算失败（关键点或基准帧不足）")

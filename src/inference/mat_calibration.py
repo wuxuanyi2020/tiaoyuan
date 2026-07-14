@@ -53,14 +53,7 @@ class MatCalibrator:
             return None
 
         h_img, w_img = frame.shape[:2]
-        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        lower_green = np.array([20, 30, 30])
-        upper_green = np.array([95, 255, 255])
-        mat_mask = cv2.inRange(hsv, lower_green, upper_green)
-
-        kernel = np.ones((5, 5), np.uint8)
-        mat_mask = cv2.morphologyEx(mat_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mat_mask = self._compute_hsv_mask(frame)
         contours, _ = cv2.findContours(mat_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return self._smooth_box
@@ -207,11 +200,23 @@ class MatCalibrator:
 
     def _compute_hsv_mask(self, frame):
         """HSV 颜色分割 + 形态学去噪。"""
+        h_img, w_img = frame.shape[:2]  # 获取画面高度和宽度
+
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        lower_green = np.array([20, 30, 30])
-        upper_green = np.array([95, 255, 255])
+        lower_green = np.array([25, 15, 15])  # H=25(防偏黄), S=15(容忍反光变淡), V=15(容忍远端变暗)
+        upper_green = np.array([90, 255, 255])
         mask = cv2.inRange(hsv, lower_green, upper_green)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # 将图像上方 40% 区域涂黑（屏蔽天空和树木噪声）
+        mask[0:int(h_img * 0.4), :] = 0
+
+        # 放大开运算内核到 9x9，强行刮掉右上角粘连的微小凸起和毛刺
+        open_kernel = np.ones((9, 9), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+
+        # 追加 5x5 微型闭运算，把被刮完毛刺的边缘收拾得更平滑
+        close_kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
         return mask
