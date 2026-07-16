@@ -336,7 +336,7 @@ class StandingLongJumpSystem:
         self._skeleton_baseline_x_cm = front_toe_cm[0]
         self._log("READY", f"骨架法基线X={self._skeleton_baseline_x_cm:.1f}cm")
 
-    def _handle_idle_skeleton(self, ankle_cm, front_toe_cm, toe_l_cm=None, toe_r_cm=None):
+    def _handle_idle_skeleton(self, frame_idx, ankle_cm, front_toe_cm, toe_l_cm=None, toe_r_cm=None):
         self.foul_detector.reset()
         # 第一阶段：脚尖进入垫子区域 → 提示人体已踏上垫子（仅首次输出）
         if front_toe_cm is not None and self.calibrator.in_mat(front_toe_cm):
@@ -347,6 +347,12 @@ class StandingLongJumpSystem:
         if ankle_cm is not None and toe_l_cm is not None and toe_r_cm is not None:
             toe_l_to_line = abs(toe_l_cm[0] - self.config.takeoff_line_cm)
             toe_r_to_line = abs(toe_r_cm[0] - self.config.takeoff_line_cm)
+            if self.debug:
+                ankle_str = f"({ankle_cm[0]:.1f},{ankle_cm[1]:.1f})cm" if ankle_cm is not None else "None"
+                ft_str = f"({front_toe_cm[0]:.1f},{front_toe_cm[1]:.1f})cm" if front_toe_cm is not None else "None"
+                self._log("DEBUG_IDLE_PARAMS", f"帧{frame_idx}: ankle={ankle_str} | front_toe={ft_str} | "
+                          f"toe_l_to_line={toe_l_to_line:.1f}cm | toe_r_to_line={toe_r_to_line:.1f}cm | "
+                          f"in_mat={self.calibrator.in_mat(front_toe_cm) if front_toe_cm else False}")
             if toe_l_to_line <= 10.0 and toe_r_to_line <= 10.0:
                 self._log("IDLE", f"检测预备起跳(骨架), ankle=({ankle_cm[0]:.1f},{ankle_cm[1]:.1f})cm")
                 self._skeleton_enter_ready(ankle_cm, front_toe_cm)
@@ -359,9 +365,15 @@ class StandingLongJumpSystem:
         curr_ankle_y_px = ankle_xy[1] if ankle_xy else 99999
 
         if ankle_cm is None:
+            if self.debug:
+                self._log("DEBUG_TAKEOFF_PARAMS", f"帧{frame_idx}: ankle_cm=None，跳过本帧")
             return
 
         if front_toe_cm is None or not self.calibrator.in_mat(front_toe_cm):
+            if self.debug:
+                in_mat_str = "N/A" if front_toe_cm is None else f"(in_mat={self.calibrator.in_mat(front_toe_cm)})"
+                ft_str = "None" if front_toe_cm is None else f"({front_toe_cm[0]:.1f},{front_toe_cm[1]:.1f})cm"
+                self._log("DEBUG_TAKEOFF_PARAMS", f"帧{frame_idx}: front_toe_cm={ft_str} {in_mat_str}，跳过本帧")
             return  # 无脚尖位置数据，跳过本帧（不用脚踝替代起跳点）
 
         cur_x = front_toe_cm[0]
@@ -523,7 +535,7 @@ class StandingLongJumpSystem:
             detected_landing = True
             landing_reason = f"超时强制落地: jump_counter={self._skeleton_jump_counter} >= max_jump_frames={self.config.max_jump_frames}"
 
-        if self.debug and not detected_landing:
+        if self.debug:
             heel_l_x = self._skeleton_foot_hist["l"]["x_cm"][-1] if self._skeleton_foot_hist["l"]["x_cm"] else None
             heel_r_x = self._skeleton_foot_hist["r"]["x_cm"][-1] if self._skeleton_foot_hist["r"]["x_cm"] else None
             contact_l_info = f"L_contact={contact_l:.1f}" if contact_l is not None else "L_contact=None"
@@ -951,7 +963,7 @@ class StandingLongJumpSystem:
                         takeoff_signal = toe_lifted or (self._skeleton_toe_missing_counter >= 2)
 
                         if self.state == "IDLE":
-                            self._handle_idle_skeleton(ankle_cm, front_toe_cm, toe_l_cm, toe_r_cm)
+                            self._handle_idle_skeleton(frame_idx, ankle_cm, front_toe_cm, toe_l_cm, toe_r_cm)
                         elif self.state == "READY":
                             self._handle_ready_skeleton(frame_idx, kpts, ankle_cm, ankle_xy,
                                                         front_toe_cm, front_toe_xy, toe_xy, takeoff_signal)
@@ -979,42 +991,32 @@ class StandingLongJumpSystem:
                     self._diff_computed = True
                     to_x, ld_x, dist = self.diff_detector.compute_combined_distance()
                     if to_x is not None and ld_x is not None:
-                        self._log("DIFF",
-                                  f"差分法结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, "
+                        log_tag = "YOLO" if self.config.enable_seg else "DIFF"
+                        log_label = "YOLO 实例分割" if self.config.enable_seg else "差分法"
+                        self._log(log_tag,
+                                  f"{log_label}结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, "
                                   f"距离={dist:.1f}cm")
                         if self.config.enable_seg:
                             self._log("YOLO_TIME",
                                       f"[{self.diff_detector.yolo_model_label}] "
                                       f"YOLO 实例分割总用时: {self.diff_detector.yolo_total_time:.3f}s")
 
-                        # YOLO 与骨骼关键点修正结果对比，取更保守值
+                        # YOLO 实例分割：始终以 YOLO 值为准
                         if self.config.enable_seg:
                             self._yolo_takeoff_x_cm = to_x
                             self._yolo_landing_x_cm = ld_x
 
-                            # 保存原始骨骼修正值（用于比较和日志）
-                            orig_takeoff_x = self.takeoff_x_cm
-                            orig_landing_x = self.landing_x_cm
+                            # 保存原始骨骼修正值（仅用于图像标注）
+                            self._skeleton_takeoff_x_cm = self.takeoff_x_cm
+                            self._skeleton_landing_x_cm = self.landing_x_cm
 
-                            to_updated = False
-                            ld_updated = False
+                            # 成绩以 YOLO 值为准
+                            self.takeoff_x_cm = to_x
+                            self.landing_x_cm = ld_x
+                            self.final_distance_cm = max(0.0, ld_x - to_x)
+                            self._log("YOLO", f"采用YOLO结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, 距离={self.final_distance_cm:.1f}cm")
 
-                            # 起跳：YOLO 更靠近 X=0 → 更保守
-                            if to_x < orig_takeoff_x:
-                                self.takeoff_x_cm = to_x
-                                to_updated = True
-                                self._log("YOLO", f"YOLO起跳点更优({to_x:.1f} < {orig_takeoff_x:.1f})，采用YOLO结果")
-
-                            # 落地：YOLO 更靠近 X=mat_length → 更保守
-                            if ld_x > orig_landing_x:
-                                self.landing_x_cm = ld_x
-                                ld_updated = True
-                                self._log("YOLO", f"YOLO落地点更优({ld_x:.1f} > {orig_landing_x:.1f})，采用YOLO结果")
-
-                            if to_updated or ld_updated:
-                                self.final_distance_cm = max(0.0, self.landing_x_cm - self.takeoff_x_cm)
-
-                            # 始终重保存 takeoff/score 图像以绘制 YOLO 线
+                            # 重保存 takeoff/score 图像以绘制 YOLO 线
                             if self._takeoff_frame_img is not None:
                                 self._takeoff_saved = False
                                 self._save_takeoff_image(

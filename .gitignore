@@ -40,6 +40,7 @@ github_token.txt
 
 # 外部依赖/备份
 HomoFormer-master/
+mediapipe-*/
 backup/
 
 # 基准测试脚本

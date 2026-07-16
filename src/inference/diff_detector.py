@@ -24,6 +24,50 @@ from PIL import Image, ImageDraw, ImageFont
 
 YOLO_MODEL_DIR = r"E:\1-8体测项目\tiaoyuan\yolo_model"
 
+# MediaPipe Pose 连接（33 点模型的核心连接）
+_MP_CONNECTIONS = [
+    (11, 12),  # 肩膀
+    (11, 23), (12, 24),  # 躯干
+    (23, 24),  # 髋
+    (23, 25), (25, 27),  # 左腿
+    (24, 26), (26, 28),  # 右腿
+    (27, 29), (29, 31),  # 左脚
+    (28, 30), (30, 32),  # 右脚
+    (27, 31), (28, 32),  # 脚掌
+]
+
+
+def _draw_kpts(img, kpts, color=(0, 255, 255), radius=4, indices=None):
+    """在图像上绘制骨骼关键点和连接线。
+
+    Args:
+        indices: 若指定，只绘制这些索引的关键点（及涉及的连线）。
+    """
+    if img is None or kpts is None:
+        return
+    h, w = img.shape[:2]
+    valid = set(range(len(kpts)))
+    if indices is not None:
+        valid = set(indices)
+    # 绘制连接线
+    for i, j in _MP_CONNECTIONS:
+        if i in valid and j in valid and i < len(kpts) and j < len(kpts):
+            xi, yi = float(kpts[i][0]), float(kpts[i][1])
+            xj, yj = float(kpts[j][0]), float(kpts[j][1])
+            if xi > 0 and yi > 0 and xj > 0 and yj > 0 and xi < w and yi < h and xj < w and yj < h:
+                cv2.line(img, (int(xi), int(yi)), (int(xj), int(yj)), (0, 255, 0), 2, lineType=cv2.LINE_AA)
+    # 绘制关键点
+    for i, pt in enumerate(kpts):
+        if i not in valid:
+            continue
+        x, y = float(pt[0]), float(pt[1])
+        if x > 0 and y > 0 and x < w and y < h:
+            cv2.circle(img, (int(x), int(y)), radius, color, -1, lineType=cv2.LINE_AA)
+            # 标注关键点序号（仅标注下半身关键点）
+            if i in (23, 24, 25, 26, 27, 28, 29, 30, 31, 32):
+                cv2.putText(img, str(i), (int(x) + 4, int(y) - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
 
 class DiffDetector:
     """差分法检测器。
@@ -149,7 +193,7 @@ class DiffDetector:
         return (x, y)
 
     def _foot_roi_gray(self, gray_img, kpts, foot_indices,
-                       expand=1.0, is_left=True, shrink_inward=0.0):
+                       expand=0.6, is_left=True, shrink_inward=0.0):
         pts_px = []
         for idx in foot_indices:
             kpt = self._get_kpt(kpts, idx)
@@ -164,18 +208,23 @@ class DiffDetector:
         ys = [p[1] for p in pts_px]
         cx, cy = float(np.mean(xs)), float(np.mean(ys))
 
+        # 分辨率自适应的最小 ROI 尺寸（参考图像短边百分比，确保物理区域一致）
+        ref = min(w_img, h_img)
+        min_half = max(ref * 0.04, 30.0)
+
         if len(pts_px) >= 2:
-            half_w = max((max(xs) - min(xs)) * expand, 40.0)
-            half_h = max((max(ys) - min(ys)) * expand, 40.0)
+            half_w = max((max(xs) - min(xs)) * expand, min_half)
+            half_h = max((max(ys) - min(ys)) * expand, min_half)
         else:
-            half_w, half_h = 60.0, 60.0
+            half_w = half_h = min_half
 
         x1 = max(0, int(cx - half_w))
         y1 = max(0, int(cy - half_h * 0.0))  # 暴力下压，避开脚踝
         x2 = min(w_img, int(cx + half_w))
-        y2 = min(h_img, int(cy + half_h * 0.6))  # 上提底部，避开下方阴影
+        y2 = min(h_img, int(cy + half_h * 0.0))  # 上提底部，避开下方阴影
 
-        margin = 30
+        # 分辨率自适应的边距（短边的 3%，替代固定 30px）
+        margin = int(ref * 0.03)
         x1 = max(0, x1 - margin)
         y1 = max(0, y1 - margin)
         x2 = min(w_img, x2 + margin)
@@ -444,6 +493,9 @@ class DiffDetector:
         vis = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # 绘制脚部骨骼关键点（踝 27/28、跟 29/30、趾 31/32）
+        _draw_kpts(vis, kpts, indices=[27, 28, 29, 30, 31, 32])
+
         colors = [("left", (0, 255, 0)), ("right", (0, 255, 255))]
         for cfg, (_, color) in zip(foot_configs, colors):
             is_left = (cfg["label"] == "left")
@@ -501,11 +553,14 @@ class DiffDetector:
 
                 # 列1: 原始BGR ROI
                 col_raw = frame[y1:y1 + h_roi, x1:x1 + w_roi]
-                # 列2: 未经高度过滤的 YOLO Mask 交集
+                # 列2: 原始分割 mask 切片（原图 + 半透明绿色 Mask 叠加）
                 raw_mask = full_mask[y1:y1 + h_roi, x1:x1 + w_roi].copy()
-                # 列3: 经过 40% 高度过滤的最终 Mask
+                col_overlay = col_raw.copy()
+                col_overlay[raw_mask > 0] = (col_overlay[raw_mask > 0] * 0.5 +
+                                              np.array([0, 200, 0], dtype=np.uint8) * 0.5).astype(np.uint8)
+                # 列3: 切割上部20%区域的二值 Mask
                 final_mask = raw_mask.copy()
-                final_mask[0:int(h_roi * 0.4), :] = 0
+                final_mask[0:int(h_roi * 0.2), :] = 0
 
                 target_h = 160
                 def _r(img):
@@ -516,18 +571,29 @@ class DiffDetector:
                     return cv2.resize(img, (nw, target_h), interpolation=cv2.INTER_AREA)
 
                 col_raw_r = _r(col_raw)
-                col_mask_r = cv2.cvtColor(_r(raw_mask), cv2.COLOR_GRAY2BGR)
+                col_overlay_r = _r(col_overlay)
                 col_final_r = cv2.cvtColor(_r(final_mask), cv2.COLOR_GRAY2BGR)
 
-                tag_h = 28
-                for cimg, t in [(col_raw_r, "RawCurrent"),
-                                (col_mask_r, "YOLO_ROI_Mask"),
-                                (col_final_r, "FinalMask")]:
-                    tb = np.zeros((tag_h, cimg.shape[1], 3), dtype=np.uint8)
-                    cv2.putText(tb, t, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                    cimg[:] = np.vstack([tb, cimg])[:cimg.shape[0]]
+                # 在 FinalMask 上标记检测到的起跳点/落地点
+                _edge_px = self._takeoff_edge_px if which == "takeoff" else self._landing_edge_px
+                _edge_label = "toe" if which == "takeoff" else "heel"
+                if _edge_px is not None:
+                    lx = int((_edge_px[0] - x1) * target_h / h_roi)
+                    ly = int((_edge_px[1] - y1) * target_h / h_roi)
+                    cv2.circle(col_final_r, (lx, ly), 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+                    cv2.putText(col_final_r, _edge_label, (lx + 8, ly - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, lineType=cv2.LINE_AA)
 
-                strip = cv2.hconcat([col_raw_r, col_mask_r, col_final_r])
+                tag_h = 28
+                imgs_tagged = []
+                for img, t in [(col_raw_r, "Raw_ROI"),
+                               (col_overlay_r, "Mask_Overlay"),
+                               (col_final_r, "FinalMask")]:
+                    tb = np.zeros((tag_h, img.shape[1], 3), dtype=np.uint8)
+                    cv2.putText(tb, t, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    imgs_tagged.append(np.vstack([tb, img]))
+
+                strip = cv2.hconcat(imgs_tagged)
                 cv2.putText(strip, cfg["label"], (8, tag_h + 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             (0, 255, 0) if is_left else (0, 255, 255), 2)
@@ -538,11 +604,12 @@ class DiffDetector:
 
             collage = cv2.vconcat(strips)
             title_h = 50
-            canvas = np.zeros((title_h + collage.shape[0], collage.shape[1], 3), dtype=np.uint8)
+            right_pad = 100  # 右侧留白，确保标题显示完整
+            canvas = np.zeros((title_h + collage.shape[0], collage.shape[1] + right_pad, 3), dtype=np.uint8)
             canvas[title_h:, :collage.shape[1]] = collage
             canvas = self._put_text_cn(
                 canvas,
-                f"Stage3 - YOLO ({label}): 原图ROI → YOLO人体Mask交集 → 高度过滤后Mask",
+                f"Stage3 - YOLO ({label}): Raw_ROI → Mask_Overlay(绿) → FinalMask(上部20%切割)",
                 (20, 6), (255, 255, 255), size=22)
             return canvas
 

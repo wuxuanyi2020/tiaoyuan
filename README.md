@@ -88,7 +88,7 @@ python main.py --video videos/跳远1-1.mp4
 | `--yolo VERSION SCALE` | - | 启用 YOLO 实例分割距离修正（与 `--diff` 互斥），如 `--yolo 26 x`。YOLO 起跳点更靠近垫子边界（更保守）时自动覆盖骨骼修正值 |
 | `--enable-mat-output` | - | 输出垫子识别图 (mat_mask_quad/hsv) |
 | `--test-grid` | - | 输出垫子毫米格测试图（起跳线外每 10cm 画一条绿线） |
-| `--debug` | - | 调试模式：每帧记录起跳/落地判定参数到日志 |
+| `--debug` | - | 调试模式：log 中逐帧记录 IDLE/READY/JUMPING 状态的起跳/落地判定参数值 |
 
 ## 输出结构
 
@@ -215,6 +215,16 @@ python main.py --yolo 8 m --video videos/跳远1-1.mp4 --no-display
 ```
 流程: 基准帧 → MOG2 前景 → 二值化 → 轮廓填充 → 脚尖/脚后跟 X
 ```
+
+### YOLO 模式 Stage3 可视化三列
+
+```
+Raw_ROI | Mask_Overlay(原图+半透绿Mask) | FinalMask(上部20%切割+toe/heel标记)
+```
+
+- **Raw_ROI**: 脚部关键点 ROI 裁剪区域（分辨率自适应 ROI 尺寸，参考图像短边百分比）
+- **Mask_Overlay**: YOLO 人体分割 Mask 半透明绿色叠加在原始 ROI 上，直观显示分割精度
+- **FinalMask**: 经上部 20% 高度过滤后的二值 Mask，黄色圆点标记检测到的脚尖(toe)/脚跟(heel)边缘点
 
 ## 犯规规则
 
