@@ -28,8 +28,8 @@ def build_parser():
     parser.add_argument("--debug-dir", type=str, default=None)
     parser.add_argument("--record", type=str, default=None, help="录制输出视频路径")
     parser.add_argument("--mat-length-cm", type=float, default=338.0)
-    parser.add_argument("--mat-width-cm", type=float, default=100.0)
-    parser.add_argument("--trigger-move-cm", type=float, default=30.0)
+    parser.add_argument("--mat-width-cm", type=float, default=90.0)
+    parser.add_argument("--trigger-move-cm", type=float, default=32.0)
     parser.add_argument("--trigger-frames", type=int, default=2)
     parser.add_argument("--min-flight-frames", type=int, default=5)
     parser.add_argument("--max-jump-frames", type=int, default=120)
@@ -44,6 +44,7 @@ def build_parser():
     parser.add_argument("--yolo", nargs=2, metavar=("VERSION", "SCALE"),
                         help="启用 YOLO 实例分割距离修正，指定版本和尺度，如 --yolo 26 x（版本: 8/11/26, 尺度: n/s/m/l/x）")
     parser.add_argument("--enable-mat-output", action="store_true", help="输出垫子识别图 (mat_mask_quad/hsv)")
+    parser.add_argument("--test-grid", action="store_true", help="输出垫子毫米格测试图")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
     parser.add_argument("--videos", nargs="*", default=None, help="批量处理指定的视频列表")
@@ -80,8 +81,9 @@ def run_single(video_path, args):
             result_dir=result_dir,
             enable_foul_detection=not args.no_foul_detection,
             landing_offset_cm=args.landing_offset_cm,
-            enable_diff=args.diff or bool(args.yolo),
+            enable_diff=args.diff and not bool(args.yolo),
             enable_mat_output=args.enable_mat_output,
+            enable_test_grid=args.test_grid,
             enable_seg=bool(args.yolo),
         yolo_version=args.yolo[0] if args.yolo else "11",
         yolo_scale=args.yolo[1] if args.yolo else "x",
@@ -201,8 +203,9 @@ def main():
         result_dir=result_dir,
         enable_foul_detection=not args.no_foul_detection,
         landing_offset_cm=args.landing_offset_cm,
-        enable_diff=args.diff or bool(args.yolo),
+        enable_diff=args.diff and not bool(args.yolo),
         enable_mat_output=args.enable_mat_output,
+        enable_test_grid=args.test_grid,
         enable_seg=bool(args.yolo),
         yolo_version=args.yolo[0] if args.yolo else "11",
         yolo_scale=args.yolo[1] if args.yolo else "x",

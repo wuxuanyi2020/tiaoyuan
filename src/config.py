@@ -11,14 +11,14 @@ class JumpConfig:
     save_path: str = "result.json"
     debug_dir: str | None = None
     mat_length_cm: float = 340.0
-    mat_width_cm: float = 90.0
+    mat_width_cm: float = 100.0
     trigger_move_cm: float = 30.0
     trigger_frames: int = 2
     min_flight_frames: int = 5
     max_jump_frames: int = 120
     backend: str = "mediapipe"
     record_path: str | None = None
-    takeoff_line_cm: float = 32.0
+    takeoff_line_cm: float = 30.0
     takeoff_offset_cm: float = 0.0
     manual_calib: bool = False
     result_dir: str | None = None  # 结果输出根目录，由 main 在运行时传入
@@ -26,6 +26,7 @@ class JumpConfig:
     landing_offset_cm: float = -5.0  # 落地点修正（鞋跟厚度补偿）
     enable_diff: bool = False  # 启用差分法距离修正（默认关闭）
     enable_mat_output: bool = False  # 输出垫子识别图 (mat_mask_quad/hsv)
+    enable_test_grid: bool = False  # 输出垫子毫米格测试图
     enable_seg: bool = False  # 是否启用 YOLOv11-seg 实例分割替代背景差分
     yolo_version: str = "11"  # YOLO 版本号: "8", "11", "26" 等
     yolo_scale: str = "x"     # YOLO 模型尺度: "n", "s", "m", "l", "x"

@@ -87,6 +87,20 @@ class Renderer:
             cv2.putText(img, label, (pt[0], pt[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     @staticmethod
+    def draw_x_point(img, H_mat2img, mat_width_cm, x_cm, color, radius=6, label=None, label_offset_y=-8):
+        """在垫子转换到图像的指定X位置画一个圆点。"""
+        if img is None or H_mat2img is None or x_cm is None:
+            return
+        mid_y = mat_width_cm / 2.0
+        pt_mat = np.array([[[x_cm, mid_y]]], dtype=np.float32)
+        pt_img = cv2.perspectiveTransform(pt_mat, H_mat2img).reshape(-1, 2)[0]
+        center = (int(pt_img[0]), int(pt_img[1]))
+        cv2.circle(img, center, radius, color, -1, lineType=cv2.LINE_AA)
+        if label:
+            cv2.putText(img, label, (center[0] + 8, center[1] + label_offset_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    @staticmethod
     def draw_measurement_line(img, H_mat2img, mat_width_cm, takeoff_x_cm, landing_x_cm):
         if img is None or H_mat2img is None or takeoff_x_cm is None or landing_x_cm is None:
             return

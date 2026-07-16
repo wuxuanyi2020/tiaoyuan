@@ -93,6 +93,7 @@ class StandingLongJumpSystem:
         self._skeleton_baseline_x_cm = None
         self._skeleton_baseline_hip_x = None
         self._skeleton_baseline_ankle_y = None
+        self._skeleton_in_mat_logged = False  # 是否已输出"人体在垫内"日志
         self._skeleton_jump_trigger_counter = 0
         self._skeleton_ready_stable = 0
         self._skeleton_front_toe_hist = deque(maxlen=30)
@@ -111,6 +112,7 @@ class StandingLongJumpSystem:
         self._prev_frame_img = None
         self._takeoff_saved = False
         self._landed_saved = False
+        self._score_saved = False
         self._foul_saved = False
         self.record_writer = None
 
@@ -192,6 +194,7 @@ class StandingLongJumpSystem:
         self._skeleton_baseline_x_cm = None
         self._skeleton_baseline_hip_x = None
         self._skeleton_baseline_ankle_y = None
+        self._skeleton_in_mat_logged = False
         self._skeleton_jump_trigger_counter = 0
         self._skeleton_ready_stable = 0
         self._skeleton_front_toe_hist.clear()
@@ -214,6 +217,7 @@ class StandingLongJumpSystem:
         self.landing_pt_xy = None
         self._takeoff_saved = False
         self._landed_saved = False
+        self._score_saved = False
         self._foul_saved = False
         self.foul_detector.reset()
         self._diff_computed = False
@@ -257,7 +261,7 @@ class StandingLongJumpSystem:
         img = frame.copy()
         self.renderer.draw_mat_outline(img, self.calibrator)
         self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                  self.config.takeoff_line_cm, (255, 255, 255), thickness=1)
+                                  self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
 
         actual_takeoff_x = self.takeoff_x_cm
         if actual_takeoff_x is not None:
@@ -324,11 +328,20 @@ class StandingLongJumpSystem:
         self._skeleton_baseline_x_cm = front_toe_cm[0]
         self._log("READY", f"骨架法基线X={self._skeleton_baseline_x_cm:.1f}cm")
 
-    def _handle_idle_skeleton(self, ankle_cm, front_toe_cm):
+    def _handle_idle_skeleton(self, ankle_cm, front_toe_cm, toe_l_cm=None, toe_r_cm=None):
         self.foul_detector.reset()
-        if ankle_cm is not None and self.calibrator.in_mat(ankle_cm):
-            self._log("IDLE", f"检测到人体在垫内(骨架), ankle=({ankle_cm[0]:.1f},{ankle_cm[1]:.1f})cm")
-            self._skeleton_enter_ready(ankle_cm, front_toe_cm)
+        # 第一阶段：脚尖进入垫子区域 → 提示人体已踏上垫子（仅首次输出）
+        if front_toe_cm is not None and self.calibrator.in_mat(front_toe_cm):
+            if not self._skeleton_in_mat_logged:
+                self._skeleton_in_mat_logged = True
+                self._log("IDLE", f"检测到人体在垫内(骨架), toe=({front_toe_cm[0]:.1f},{front_toe_cm[1]:.1f})cm")
+        # 第二阶段：双脚脚尖都距起跳线 ≤ 5cm → 预备起跳，切换至 READY
+        if ankle_cm is not None and toe_l_cm is not None and toe_r_cm is not None:
+            toe_l_to_line = abs(toe_l_cm[0] - self.config.takeoff_line_cm)
+            toe_r_to_line = abs(toe_r_cm[0] - self.config.takeoff_line_cm)
+            if toe_l_to_line <= 10.0 and toe_r_to_line <= 10.0:
+                self._log("IDLE", f"检测预备起跳(骨架), ankle=({ankle_cm[0]:.1f},{ankle_cm[1]:.1f})cm")
+                self._skeleton_enter_ready(ankle_cm, front_toe_cm)
 
     def _handle_ready_skeleton(self, frame_idx, kpts, ankle_cm, ankle_xy, front_toe_cm, front_toe_xy, toe_xy, takeoff_signal):
         hip_l = self._get_kpt(kpts, self.kpt_idx["l_hip"])
@@ -555,23 +568,46 @@ class StandingLongJumpSystem:
             return
         all_kpts = all_kpts_list if all_kpts_list is not None else (self.pose_estimator.all_kpts_list or [])
         img = frame.copy()
+
+        # 计算原始起跳点（减去偏移）和修正后起跳点
+        raw_takeoff_x = self.takeoff_x_cm - self.takeoff_display_offset_cm
+        corrected_takeoff_x = self.takeoff_x_cm
+
+        H = self.calibrator.H_mat2img
+        mw = self.calibrator.mat_width_cm
+
+        # 垫子轮廓
         self.renderer.draw_mat_outline(img, self.calibrator)
-        self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                  self.config.takeoff_line_cm, (255, 255, 255), thickness=1)
+
+        # 标准起跳线（白色）
+        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+
+        # 骨架和脚点
         if kpts is not None:
             self.renderer.draw_pose(img, kpts, self.pose_estimator.mp_connections, color=(0, 255, 0))
             self.renderer.draw_feet(img, self._get_feet, kpts)
         for pk in all_kpts:
             self.renderer.draw_pose(img, pk, self.pose_estimator.mp_connections, color=(0, 255, 0))
             self.renderer.draw_feet(img, self._get_feet, pk)
-        if self.takeoff_x_cm is not None:
-            self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                      self.takeoff_x_cm, (0, 255, 255), thickness=2, label="Takeoff")
-        takeoff_text = f"起跳点: {self.takeoff_x_cm:.1f} cm" if self.takeoff_x_cm is not None else "起跳点: 无"
-        img = self.renderer.put_text_chinese(img, f"起跳帧", (50, 80), (0, 255, 255), size=50)
-        img = self.renderer.put_text_chinese(img, takeoff_text, (50, 140), (255, 255, 0), size=30)
+
+        # 原始起跳点（青色）及起跳线
+        if raw_takeoff_x is not None:
+            self.renderer.draw_x_point(img, H, mw, raw_takeoff_x, (255, 255, 0), radius=6, label="raw", label_offset_y=-8)
+            self.renderer.draw_x_line(img, H, mw, raw_takeoff_x, (255, 255, 0), thickness=1)
+
+        # 修正后起跳点（黄色）及起跳线
+        if corrected_takeoff_x is not None:
+            self.renderer.draw_x_point(img, H, mw, corrected_takeoff_x, (0, 255, 255), radius=8, label="corrected", label_offset_y=20)
+            self.renderer.draw_x_line(img, H, mw, corrected_takeoff_x, (0, 255, 255), thickness=2)
+
+        # 左上角文字
+        img = self.renderer.put_text_chinese(img, "起跳帧", (50, 80), (0, 255, 255), size=50)
+        img = self.renderer.put_text_chinese(img,
+            f"起跳点: {corrected_takeoff_x:.1f} cm (offset={self.takeoff_display_offset_cm:.1f})",
+            (50, 140), (255, 255, 0), size=30)
         if self.foul_detector.reason:
             img = self.renderer.put_text_chinese(img, f"犯规: {self.foul_detector.reason}", (50, 200), (0, 0, 255), size=40)
+
         filename = os.path.join(self.images_dir, "takeoff.jpeg")
         imwrite_safe(filename, img)
         self._log("SAVE", f"起跳图片已保存: {filename}")
@@ -582,40 +618,86 @@ class StandingLongJumpSystem:
             return
 
         img = (self._landing_frame_img if self._landing_frame_img is not None else frame).copy()
+
+        # 计算原始和修正值
+        raw_landing_x = self.landing_x_cm - self.landing_offset_cm
+        corrected_landing_x = self.landing_x_cm
+
+        H = self.calibrator.H_mat2img
+        mw = self.calibrator.mat_width_cm
+
         self.renderer.draw_mat_outline(img, self.calibrator)
-        self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                  self.config.takeoff_line_cm, (255, 255, 255), thickness=1)
+
+        # 标准起跳线（白色）
+        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+
+        # 骨架
         if kpts is not None:
             self.renderer.draw_pose(img, kpts, self.pose_estimator.mp_connections, color=(0, 255, 0))
-        if self.takeoff_x_cm is not None:
-            self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                      self.takeoff_x_cm, (0, 255, 255))
-        if self.landing_x_cm is not None:
-            # landing_x_cm 已包含 offset，落地线与量距线据此绘制保持一致
-            self.renderer.draw_x_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                      self.landing_x_cm, (0, 0, 255))
-            landing_display_x = self.landing_x_cm
-        else:
-            landing_display_x = None
-        self.renderer.draw_measurement_line(img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                            self.takeoff_x_cm, self.landing_x_cm)
-        # 左上角标注成绩
-        score_text = f"成绩: {self.final_distance_cm:.1f} cm" if self.final_distance_cm is not None else "成绩: 无"
-        takeoff_text = f"起跳点: {self.takeoff_x_cm:.1f} cm" if self.takeoff_x_cm is not None else ""
-        landing_text = f"落地点: {landing_display_x:.1f} cm (offset={self.landing_offset_cm:.1f})" if landing_display_x is not None else ""
-        img = self.renderer.put_text_chinese(img, score_text, (50, 80), (0, 255, 0), size=50)
-        if takeoff_text:
-            img = self.renderer.put_text_chinese(img, takeoff_text, (50, 140), (255, 255, 0), size=30)
-        if landing_text:
-            img = self.renderer.put_text_chinese(img, landing_text, (50, 180), (255, 255, 0), size=30)
+
+        # 原始落地点（品红色）及落地线
+        if raw_landing_x is not None:
+            self.renderer.draw_x_point(img, H, mw, raw_landing_x, (255, 0, 255), radius=6, label="raw", label_offset_y=-8)
+            self.renderer.draw_x_line(img, H, mw, raw_landing_x, (255, 0, 255), thickness=1)
+
+        # 修正后落地点（红色）及落地线
+        if corrected_landing_x is not None:
+            self.renderer.draw_x_point(img, H, mw, corrected_landing_x, (0, 0, 255), radius=8, label="corrected", label_offset_y=20)
+            self.renderer.draw_x_line(img, H, mw, corrected_landing_x, (0, 0, 255), thickness=2)
+
+        # 左上角文字
+        img = self.renderer.put_text_chinese(img, "落地帧", (50, 80), (0, 255, 255), size=50)
+        img = self.renderer.put_text_chinese(img,
+            f"落地点: {corrected_landing_x:.1f} cm (offset={self.landing_offset_cm:.1f})",
+            (50, 140), (255, 255, 0), size=30)
         if self.foul_detector.reason:
-            img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, 230), (0, 0, 255), size=50)
+            img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, 200), (0, 0, 255), size=50)
 
         filename = os.path.join(self.images_dir, "landed.jpeg")
         imwrite_safe(filename, img)
         self._log("SAVE", f"落地图片已保存: {filename}")
         self._landed_saved = True
         self._save_payload()
+
+    def _save_score_image(self, frame):
+        """保存成绩图像，标注修正后起跳点/落地线、标准起跳线及成绩文本。"""
+        if not self.images_dir or self._score_saved:
+            return
+        if self.takeoff_x_cm is None or self.landing_x_cm is None:
+            return
+
+        img = frame.copy()
+        H = self.calibrator.H_mat2img
+        mw = self.calibrator.mat_width_cm
+
+        self.renderer.draw_mat_outline(img, self.calibrator)
+
+        # 标准起跳线（白色）
+        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+
+        # 修正后起跳点（黄色）及起跳线
+        self.renderer.draw_x_point(img, H, mw, self.takeoff_x_cm, (0, 255, 255), radius=8, label="takeoff")
+        self.renderer.draw_x_line(img, H, mw, self.takeoff_x_cm, (0, 255, 255), thickness=2)
+
+        # 修正后落地点（红色）及落地线
+        self.renderer.draw_x_point(img, H, mw, self.landing_x_cm, (0, 0, 255), radius=8, label="landing")
+        self.renderer.draw_x_line(img, H, mw, self.landing_x_cm, (0, 0, 255), thickness=2)
+
+        # 测量连线（绿色）
+        self.renderer.draw_measurement_line(img, H, mw, self.takeoff_x_cm, self.landing_x_cm)
+
+        # 左上角文字
+        score_text = f"成绩: {self.final_distance_cm:.1f} cm"
+        to_text = f"起跳点: {self.takeoff_x_cm:.1f} cm (offset={self.takeoff_display_offset_cm:.1f})"
+        ld_text = f"落地点: {self.landing_x_cm:.1f} cm (offset={self.landing_offset_cm:.1f})"
+        img = self.renderer.put_text_chinese(img, score_text, (50, 80), (0, 255, 0), size=50)
+        img = self.renderer.put_text_chinese(img, to_text, (50, 145), (255, 255, 0), size=30)
+        img = self.renderer.put_text_chinese(img, ld_text, (50, 195), (0, 0, 255), size=30)
+
+        filename = os.path.join(self.images_dir, "score.jpeg")
+        imwrite_safe(filename, img)
+        self._log("SAVE", f"成绩图片已保存: {filename}")
+        self._score_saved = True
 
     def _save_diff_image(self):
         """分步保存差分/YOLO 各阶段过程照片。
@@ -673,7 +755,7 @@ class StandingLongJumpSystem:
 
         self.renderer.draw_mat_outline(display_img, self.calibrator)
         self.renderer.draw_x_line(display_img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
-                                  self.config.takeoff_line_cm, (255, 255, 255), thickness=1, label="Limit")
+                                  self.config.takeoff_line_cm, (255, 255, 255), thickness=3, label="Limit")
         self.renderer.draw_measurement_line(display_img, self.calibrator.H_mat2img, self.calibrator.mat_width_cm,
                                             self.takeoff_x_cm, self.landing_x_cm)
 
@@ -768,6 +850,22 @@ class StandingLongJumpSystem:
                                 imwrite_safe(os.path.join(self.images_dir, "mat_mask_hsv.jpeg"), cv2.cvtColor(mask_hsv, cv2.COLOR_GRAY2BGR))
                             self._log("CALIB", "垫子识别图已保存: mat_mask_quad.jpeg (四边形拟合), mat_mask_hsv.jpeg (HSV原始)")
 
+                        # 垫子毫米格测试图（默认不输出）
+                        if self.config.enable_test_grid and self.images_dir:
+                            grid_img = frame.copy()
+                            self.renderer.draw_mat_outline(grid_img, self.calibrator)
+                            self.renderer.draw_x_line(grid_img, self.calibrator.H_mat2img,
+                                                      self.calibrator.mat_width_cm,
+                                                      self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+                            step = 10.0
+                            x = self.config.takeoff_line_cm + step
+                            while x <= self.calibrator.mat_length_cm:
+                                self.renderer.draw_x_line(grid_img, self.calibrator.H_mat2img,
+                                                          self.calibrator.mat_width_cm, x, (0, 255, 0), thickness=1)
+                                x += step
+                            imwrite_safe(os.path.join(self.images_dir, "test_grid.jpeg"), grid_img)
+                            self._log("CALIB", "垫子毫米格测试图已保存: test_grid.jpeg")
+
                 # ── 差分法：基准帧捕获（垫子上无人时） ──
                 if (self.config.enable_diff
                         and self.calibrator.calibrated
@@ -823,7 +921,7 @@ class StandingLongJumpSystem:
                         takeoff_signal = toe_lifted or (self._skeleton_toe_missing_counter >= 2)
 
                         if self.state == "IDLE":
-                            self._handle_idle_skeleton(ankle_cm, front_toe_cm)
+                            self._handle_idle_skeleton(ankle_cm, front_toe_cm, toe_l_cm, toe_r_cm)
                         elif self.state == "READY":
                             self._handle_ready_skeleton(frame_idx, kpts, ankle_cm, ankle_xy,
                                                         front_toe_cm, front_toe_xy, toe_xy, takeoff_signal)
@@ -863,8 +961,10 @@ class StandingLongJumpSystem:
                         self._log("DIFF", "差分法计算失败（关键点或基准帧不足）")
 
                 self._save_landed_image(frame, kpts)
-                if self.state == "LANDED" and not self.config.display:
-                    break
+                if self.state == "LANDED":
+                    self._save_score_image(frame)
+                    if not self.config.display:
+                        break
 
                 if self.config.display or self.config.record_path:
                     composed = self._compose_display(frame, display_img, kpts)

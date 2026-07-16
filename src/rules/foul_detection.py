@@ -54,7 +54,7 @@ class FoulDetector:
                     points.append(feet["l"])
                 if feet["r"]:
                     points.append(feet["r"])
-            if any(self.calibrator.strict_in_mat(self.transform_to_mat_cm(pt)) for pt in points):
+            if any(self.calibrator.in_mat(self.transform_to_mat_cm(pt)) for pt in points):
                 valid_people_in_mat += 1
         if valid_people_in_mat >= 2:
             self._set_reason("多人入界 (Multi-Person)", f"检测到犯规动作: 多人入界 (Multi-Person), count={valid_people_in_mat}")

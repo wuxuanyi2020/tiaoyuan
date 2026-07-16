@@ -162,17 +162,11 @@ class MatCalibrator:
         dst = cv2.perspectiveTransform(src, self.H_img2mat)[0][0]
         return float(dst[0]), float(dst[1])
 
-    def strict_in_mat(self, xy_cm):
-        if xy_cm is None:
-            return False
-        x, y = xy_cm
-        return (-5.0 <= x <= self.mat_length_cm + 5.0) and (-5.0 <= y <= self.mat_width_cm + 5.0)
-
     def in_mat(self, xy_cm):
         if xy_cm is None:
             return False
         x, y = xy_cm
-        return (-50.0 <= x <= self.mat_length_cm) and (-50.0 <= y <= self.mat_width_cm + 50.0)
+        return (0.0 <= x <= self.mat_length_cm) and (0.0 <= y <= self.mat_width_cm )
 
     def get_H_img2mat_px(self):
         if self.H_img2mat is None:
