@@ -85,9 +85,9 @@ python main.py --video videos/跳远1-1.mp4
 | `--manual-calib` | - | 手动四点标定（鼠标点击） |
 | `--no-foul-detection` | - | 禁用犯规检测 |
 | `--diff` | - | 启用 MOG2 背景差分法距离修正（与 `--yolo` 互斥） |
-| `--yolo VERSION SCALE` | - | 启用 YOLO 实例分割距离修正（与 `--diff` 互斥），如 `--yolo 26 x` |
+| `--yolo VERSION SCALE` | - | 启用 YOLO 实例分割距离修正（与 `--diff` 互斥），如 `--yolo 26 x`。YOLO 起跳点更靠近垫子边界（更保守）时自动覆盖骨骼修正值 |
 | `--enable-mat-output` | - | 输出垫子识别图 (mat_mask_quad/hsv) |
-| `--test-grid` | - | 输出垫子毫米格测试图 |
+| `--test-grid` | - | 输出垫子毫米格测试图（起跳线外每 10cm 画一条绿线） |
 | `--debug` | - | 调试模式：每帧记录起跳/落地判定参数到日志 |
 
 ## 输出结构
@@ -101,8 +101,8 @@ result/
         │   ├── mat_mask_quad.jpeg         # 垫子识别图（四边形拟合）
         │   ├── mat_mask_hsv.jpeg          # 垫子识别图（HSV 原始）
         │   ├── test_grid.jpeg             # 垫子毫米格测试图
-        │   ├── takeoff.jpeg               # 起跳帧标注图（含 raw/corrected 起跳线）
-        │   ├── landed.jpeg                # 落地帧标注图（含 raw/corrected 落地线）
+        │   ├── takeoff.jpeg               # 起跳帧标注图（limit + fixed corrected + yolo corrected）
+        │   ├── landed.jpeg                # 落地帧标注图（limit + fixed corrected + yolo corrected）
         │   ├── score.jpeg                 # 成绩汇总图（起跳线+落地线+测量线）
         │   ├── foul-*.jpeg                # 犯规截图
         │   ├── diff/                       # MOG2 差分过程图（需 --diff）
@@ -116,9 +116,9 @@ result/
 
 | 图像 | 内容 |
 |------|------|
-| `takeoff.jpeg` | 白色标准起跳线 + 青色原始起跳点/线 + 黄色修正起跳点/线 |
-| `landed.jpeg` | 白色标准起跳线 + 品红原始落地点/线 + 红色修正落地点/线 |
-| `score.jpeg` | 白色标准起跳线 + 黄色修正起跳线 + 红色修正落地线 + 绿色测量连线 |
+| `takeoff.jpeg` | `limit` 白色标准起跳线 + `fixed corrected` 黄色骨骼修正起跳点/线 + `yolo corrected` 绿色 YOLO 修正起跳点/线（`--yolo` 时） |
+| `landed.jpeg` | `limit` 白色标准起跳线 + `fixed corrected` 红色骨骼修正落地点/线 + `yolo corrected` 绿色 YOLO 修正落地点/线（`--yolo` 时） |
+| `score.jpeg` | 所有线（limit 白、fixed corrected 黄/红、yolo corrected 绿）+ 绿色测量连线 |
 
 `result.json` 格式:
 
@@ -162,8 +162,8 @@ tiaoyuan/
 1. **垫子标定**: HSV 颜色分割自动识别绿色垫子，通过轮廓拟合四边形并计算透视变换矩阵。支持画面顶部 40% 区域屏蔽以滤除天空/树木等绿色噪声，形态学操作使用 9x9 开运算 + 5x5 闭运算去除毛刺
 2. **人体检测**: 通过 MediaPipe PoseLandmarker 获取每帧 33 个骨骼关键点坐标（含脚趾、脚踝、脚后跟）
 3. **两阶段入垫检测**:
-   - 阶段一：脚尖进入垫子软检测范围（±50cm）→ 输出人已上垫日志
-   - 阶段二：双脚脚尖均距起跳线 ≤ 5cm → 切换至 READY 状态
+   - 阶段一：脚尖进入垫子软检测范围（`in_mat()`，±50cm）→ 输出 "检测到人体在垫内" 日志（仅一次）
+   - 阶段二：**双脚**脚尖均距起跳线 ≤ 5cm → 输出 "检测预备起跳" 日志，切换至 READY 状态
 4. **站立稳定期**: 稳定站立阶段（脚尖位移 < 6cm）记录脚尖基线 X 和脚踝 Y 基线（EMA 指数平滑更新），稳定帧数积累
 5. **起跳判定**（满足任一）:
    - **脚尖大幅前移**: `toe_moved > max(trigger_move_cm, 30.0)`
@@ -182,6 +182,11 @@ tiaoyuan/
 ```
 流程: 全图 YOLO 推理 → person 二值 Mask → 脚部关键点 ROI 裁剪 → 脚尖/脚跟 X 提取
 ```
+
+YOLO 结果与骨骼关键点修正值自动对比，取更保守值：
+- **起跳**：YOLO 脚尖 X 更靠近 0（垫子边界）→ 采用 YOLO 值作为最终起跳点
+- **落地**：YOLO 脚跟 X 更靠近 `mat_length`（垫子末端）→ 采用 YOLO 值作为最终落地点
+- 输出图像中分别用绿色 `yolo corrected` 和黄色/红色 `fixed corrected` 标注两条线
 
 支持的模型组合：
 

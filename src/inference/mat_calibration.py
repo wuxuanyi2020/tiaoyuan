@@ -68,7 +68,7 @@ class MatCalibrator:
             hull = cv2.convexHull(contour)
             peri = cv2.arcLength(hull, True)
             quad = None
-            for factor in [0.01, 0.02, 0.03, 0.05]:
+            for factor in [0.005, 0.01, 0.015, 0.02]:
                 approx = cv2.approxPolyDP(hull, factor * peri, True)
                 if len(approx) == 4 and cv2.isContourConvex(approx):
                     quad = approx.reshape(4, 2).astype(np.float32)
@@ -93,7 +93,7 @@ class MatCalibrator:
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        refined = cv2.cornerSubPix(gray, best_quad, (11, 11), (-1, -1), criteria)
+        refined = cv2.cornerSubPix(gray, best_quad, (15, 15), (-1, -1), criteria)
         if self._smooth_box is None:
             self._smooth_box = refined
         else:

@@ -122,6 +122,14 @@ class StandingLongJumpSystem:
         self.takeoff_display_offset_cm = float(config.takeoff_offset_cm)
         self.landing_offset_cm = float(config.landing_offset_cm)
 
+        # 骨骼修正值（YOLO 覆盖前保存，供 raw 计算使用）
+        self._skeleton_takeoff_x_cm = None
+        self._skeleton_landing_x_cm = None
+
+        # YOLO 标志
+        self._yolo_takeoff_x_cm = None
+        self._yolo_landing_x_cm = None
+
         if config.display:
             cv2.namedWindow("Auto Long Jump", cv2.WINDOW_NORMAL)
             if self.calibrator.manual_mode:
@@ -473,10 +481,13 @@ class StandingLongJumpSystem:
         self.takeoff_pt_px = takeoff_pt_px
         self.takeoff_pt_xy = self.takeoff_pt_px
         self.takeoff_x_cm = takeoff_x + self.takeoff_display_offset_cm
+        self._skeleton_takeoff_x_cm = self.takeoff_x_cm  # 骨骼修正值（YOLO 覆盖前保存）
         self._save_takeoff_image(takeoff_img if takeoff_img is not None else frame, takeoff_kpts, takeoff_all_kpts)
         self._takeoff_frame_img = takeoff_img.copy() if takeoff_img is not None else None
-        # 差分法：保存起跳帧
-        if self.diff_detector.has_base_frame:
+        self._takeoff_kpts = takeoff_kpts
+        self._takeoff_all_kpts_list = takeoff_all_kpts
+        # 差分法/YOLO：保存起跳帧
+        if self.config.enable_seg or self.diff_detector.has_base_frame:
             takeoff_frame_save = takeoff_img if takeoff_img is not None else frame
             self.diff_detector.save_takeoff_frame(takeoff_frame_save, takeoff_kpts)
 
@@ -557,6 +568,7 @@ class StandingLongJumpSystem:
         self.landing_pt_px = landing_xy_candidate
         self.landing_pt_xy = self.landing_pt_px
         self.landing_x_cm = landing_x_for_dist
+        self._skeleton_landing_x_cm = self.landing_x_cm  # 骨骼修正值（YOLO 覆盖前保存）
         self.final_distance_cm = max(0.0, temp_dist)
         if self.config.debug_dir:
             self._landing_frame_img = None
@@ -569,18 +581,14 @@ class StandingLongJumpSystem:
         all_kpts = all_kpts_list if all_kpts_list is not None else (self.pose_estimator.all_kpts_list or [])
         img = frame.copy()
 
-        # 计算原始起跳点（减去偏移）和修正后起跳点
-        raw_takeoff_x = self.takeoff_x_cm - self.takeoff_display_offset_cm
-        corrected_takeoff_x = self.takeoff_x_cm
-
         H = self.calibrator.H_mat2img
         mw = self.calibrator.mat_width_cm
 
         # 垫子轮廓
         self.renderer.draw_mat_outline(img, self.calibrator)
 
-        # 标准起跳线（白色）
-        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+        # 标准起跳线（白色）— limit
+        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3, label="limit")
 
         # 骨架和脚点
         if kpts is not None:
@@ -590,23 +598,29 @@ class StandingLongJumpSystem:
             self.renderer.draw_pose(img, pk, self.pose_estimator.mp_connections, color=(0, 255, 0))
             self.renderer.draw_feet(img, self._get_feet, pk)
 
-        # 原始起跳点（青色）及起跳线
-        if raw_takeoff_x is not None:
-            self.renderer.draw_x_point(img, H, mw, raw_takeoff_x, (255, 255, 0), radius=6, label="raw", label_offset_y=-8)
-            self.renderer.draw_x_line(img, H, mw, raw_takeoff_x, (255, 255, 0), thickness=1)
+        # fixed corrected 起跳线（黄色）— 骨骼关键点 + offset 修正
+        fixed_corrected_x = self._skeleton_takeoff_x_cm or self.takeoff_x_cm
+        if fixed_corrected_x is not None:
+            self.renderer.draw_x_point(img, H, mw, fixed_corrected_x, (0, 255, 255), radius=8, label="fixed corrected", label_offset_y=20)
+            self.renderer.draw_x_line(img, H, mw, fixed_corrected_x, (0, 255, 255), thickness=2)
 
-        # 修正后起跳点（黄色）及起跳线
-        if corrected_takeoff_x is not None:
-            self.renderer.draw_x_point(img, H, mw, corrected_takeoff_x, (0, 255, 255), radius=8, label="corrected", label_offset_y=20)
-            self.renderer.draw_x_line(img, H, mw, corrected_takeoff_x, (0, 255, 255), thickness=2)
+        # yolo corrected 起跳线（绿色）— YOLO 实例分割修正
+        if self._yolo_takeoff_x_cm is not None:
+            self.renderer.draw_x_point(img, H, mw, self._yolo_takeoff_x_cm, (0, 255, 0), radius=8, label="yolo corrected", label_offset_y=-8)
+            self.renderer.draw_x_line(img, H, mw, self._yolo_takeoff_x_cm, (0, 255, 0), thickness=2)
 
         # 左上角文字
         img = self.renderer.put_text_chinese(img, "起跳帧", (50, 80), (0, 255, 255), size=50)
         img = self.renderer.put_text_chinese(img,
-            f"起跳点: {corrected_takeoff_x:.1f} cm (offset={self.takeoff_display_offset_cm:.1f})",
-            (50, 140), (255, 255, 0), size=30)
+            f"fixed corrected: {fixed_corrected_x:.1f} cm (offset={self.takeoff_display_offset_cm:.1f})",
+            (50, 140), (255, 255, 0), size=25)
+        if self._yolo_takeoff_x_cm is not None:
+            img = self.renderer.put_text_chinese(img,
+                f"yolo corrected: {self._yolo_takeoff_x_cm:.1f} cm",
+                (50, 175), (0, 255, 0), size=25)
         if self.foul_detector.reason:
-            img = self.renderer.put_text_chinese(img, f"犯规: {self.foul_detector.reason}", (50, 200), (0, 0, 255), size=40)
+            y_offset = 210 if self._yolo_takeoff_x_cm is not None else 175
+            img = self.renderer.put_text_chinese(img, f"犯规: {self.foul_detector.reason}", (50, y_offset), (0, 0, 255), size=40)
 
         filename = os.path.join(self.images_dir, "takeoff.jpeg")
         imwrite_safe(filename, img)
@@ -619,39 +633,41 @@ class StandingLongJumpSystem:
 
         img = (self._landing_frame_img if self._landing_frame_img is not None else frame).copy()
 
-        # 计算原始和修正值
-        raw_landing_x = self.landing_x_cm - self.landing_offset_cm
-        corrected_landing_x = self.landing_x_cm
-
         H = self.calibrator.H_mat2img
         mw = self.calibrator.mat_width_cm
 
         self.renderer.draw_mat_outline(img, self.calibrator)
 
-        # 标准起跳线（白色）
-        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+        # 标准起跳线（白色）— limit
+        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3, label="limit")
 
         # 骨架
         if kpts is not None:
             self.renderer.draw_pose(img, kpts, self.pose_estimator.mp_connections, color=(0, 255, 0))
 
-        # 原始落地点（品红色）及落地线
-        if raw_landing_x is not None:
-            self.renderer.draw_x_point(img, H, mw, raw_landing_x, (255, 0, 255), radius=6, label="raw", label_offset_y=-8)
-            self.renderer.draw_x_line(img, H, mw, raw_landing_x, (255, 0, 255), thickness=1)
+        # fixed corrected 落地线（红色）— 骨骼关键点 + offset 修正
+        fixed_corrected_x = self._skeleton_landing_x_cm or self.landing_x_cm
+        if fixed_corrected_x is not None:
+            self.renderer.draw_x_point(img, H, mw, fixed_corrected_x, (0, 0, 255), radius=8, label="fixed corrected", label_offset_y=20)
+            self.renderer.draw_x_line(img, H, mw, fixed_corrected_x, (0, 0, 255), thickness=2)
 
-        # 修正后落地点（红色）及落地线
-        if corrected_landing_x is not None:
-            self.renderer.draw_x_point(img, H, mw, corrected_landing_x, (0, 0, 255), radius=8, label="corrected", label_offset_y=20)
-            self.renderer.draw_x_line(img, H, mw, corrected_landing_x, (0, 0, 255), thickness=2)
+        # yolo corrected 落地线（绿色）— YOLO 实例分割修正
+        if self._yolo_landing_x_cm is not None:
+            self.renderer.draw_x_point(img, H, mw, self._yolo_landing_x_cm, (0, 255, 0), radius=8, label="yolo corrected", label_offset_y=-8)
+            self.renderer.draw_x_line(img, H, mw, self._yolo_landing_x_cm, (0, 255, 0), thickness=2)
 
         # 左上角文字
         img = self.renderer.put_text_chinese(img, "落地帧", (50, 80), (0, 255, 255), size=50)
         img = self.renderer.put_text_chinese(img,
-            f"落地点: {corrected_landing_x:.1f} cm (offset={self.landing_offset_cm:.1f})",
-            (50, 140), (255, 255, 0), size=30)
+            f"fixed corrected: {fixed_corrected_x:.1f} cm (offset={self.landing_offset_cm:.1f})",
+            (50, 140), (0, 0, 255), size=25)
+        if self._yolo_landing_x_cm is not None:
+            img = self.renderer.put_text_chinese(img,
+                f"yolo corrected: {self._yolo_landing_x_cm:.1f} cm",
+                (50, 175), (0, 255, 0), size=25)
         if self.foul_detector.reason:
-            img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, 200), (0, 0, 255), size=50)
+            y_offset = 210 if self._yolo_landing_x_cm is not None else 175
+            img = self.renderer.put_text_chinese(img, f"INVALID: {self.foul_detector.reason}", (50, y_offset), (0, 0, 255), size=50)
 
         filename = os.path.join(self.images_dir, "landed.jpeg")
         imwrite_safe(filename, img)
@@ -672,27 +688,41 @@ class StandingLongJumpSystem:
 
         self.renderer.draw_mat_outline(img, self.calibrator)
 
-        # 标准起跳线（白色）
-        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3)
+        # 标准起跳线（白色）— limit
+        self.renderer.draw_x_line(img, H, mw, self.config.takeoff_line_cm, (255, 255, 255), thickness=3, label="limit")
 
-        # 修正后起跳点（黄色）及起跳线
-        self.renderer.draw_x_point(img, H, mw, self.takeoff_x_cm, (0, 255, 255), radius=8, label="takeoff")
-        self.renderer.draw_x_line(img, H, mw, self.takeoff_x_cm, (0, 255, 255), thickness=2)
+        # fixed corrected 起跳线（黄色）— 骨骼关键点 + offset 修正
+        to_fixed = self._skeleton_takeoff_x_cm or self.takeoff_x_cm
+        if to_fixed is not None:
+            self.renderer.draw_x_point(img, H, mw, to_fixed, (0, 255, 255), radius=8, label="fixed corrected")
+            self.renderer.draw_x_line(img, H, mw, to_fixed, (0, 255, 255), thickness=2)
 
-        # 修正后落地点（红色）及落地线
-        self.renderer.draw_x_point(img, H, mw, self.landing_x_cm, (0, 0, 255), radius=8, label="landing")
-        self.renderer.draw_x_line(img, H, mw, self.landing_x_cm, (0, 0, 255), thickness=2)
+        # yolo corrected 起跳线（绿色）
+        if self._yolo_takeoff_x_cm is not None:
+            self.renderer.draw_x_point(img, H, mw, self._yolo_takeoff_x_cm, (0, 255, 0), radius=8, label="yolo corrected", label_offset_y=48)
+            self.renderer.draw_x_line(img, H, mw, self._yolo_takeoff_x_cm, (0, 255, 0), thickness=2)
 
-        # 测量连线（绿色）
+        # fixed corrected 落地线（红色）— 骨骼关键点 + offset 修正
+        ld_fixed = self._skeleton_landing_x_cm or self.landing_x_cm
+        if ld_fixed is not None:
+            self.renderer.draw_x_point(img, H, mw, ld_fixed, (0, 0, 255), radius=8, label="fixed corrected")
+            self.renderer.draw_x_line(img, H, mw, ld_fixed, (0, 0, 255), thickness=2)
+
+        # yolo corrected 落地线（绿色）
+        if self._yolo_landing_x_cm is not None:
+            self.renderer.draw_x_point(img, H, mw, self._yolo_landing_x_cm, (0, 255, 0), radius=8, label="yolo corrected", label_offset_y=48)
+            self.renderer.draw_x_line(img, H, mw, self._yolo_landing_x_cm, (0, 255, 0), thickness=2)
+
+        # 测量连线（绿色）— 连接最终采用的起跳点和落地点
         self.renderer.draw_measurement_line(img, H, mw, self.takeoff_x_cm, self.landing_x_cm)
 
         # 左上角文字
         score_text = f"成绩: {self.final_distance_cm:.1f} cm"
-        to_text = f"起跳点: {self.takeoff_x_cm:.1f} cm (offset={self.takeoff_display_offset_cm:.1f})"
-        ld_text = f"落地点: {self.landing_x_cm:.1f} cm (offset={self.landing_offset_cm:.1f})"
+        to_text = f"起跳: {self.takeoff_x_cm:.1f} cm | fixed: {to_fixed:.1f} | yolo: {self._yolo_takeoff_x_cm or 'N/A'}"
+        ld_text = f"落地: {self.landing_x_cm:.1f} cm | fixed: {ld_fixed:.1f} | yolo: {self._yolo_landing_x_cm or 'N/A'}"
         img = self.renderer.put_text_chinese(img, score_text, (50, 80), (0, 255, 0), size=50)
-        img = self.renderer.put_text_chinese(img, to_text, (50, 145), (255, 255, 0), size=30)
-        img = self.renderer.put_text_chinese(img, ld_text, (50, 195), (0, 0, 255), size=30)
+        img = self.renderer.put_text_chinese(img, to_text, (50, 145), (255, 255, 0), size=22)
+        img = self.renderer.put_text_chinese(img, ld_text, (50, 180), (0, 0, 255), size=22)
 
         filename = os.path.join(self.images_dir, "score.jpeg")
         imwrite_safe(filename, img)
@@ -956,6 +986,49 @@ class StandingLongJumpSystem:
                             self._log("YOLO_TIME",
                                       f"[{self.diff_detector.yolo_model_label}] "
                                       f"YOLO 实例分割总用时: {self.diff_detector.yolo_total_time:.3f}s")
+
+                        # YOLO 与骨骼关键点修正结果对比，取更保守值
+                        if self.config.enable_seg:
+                            self._yolo_takeoff_x_cm = to_x
+                            self._yolo_landing_x_cm = ld_x
+
+                            # 保存原始骨骼修正值（用于比较和日志）
+                            orig_takeoff_x = self.takeoff_x_cm
+                            orig_landing_x = self.landing_x_cm
+
+                            to_updated = False
+                            ld_updated = False
+
+                            # 起跳：YOLO 更靠近 X=0 → 更保守
+                            if to_x < orig_takeoff_x:
+                                self.takeoff_x_cm = to_x
+                                to_updated = True
+                                self._log("YOLO", f"YOLO起跳点更优({to_x:.1f} < {orig_takeoff_x:.1f})，采用YOLO结果")
+
+                            # 落地：YOLO 更靠近 X=mat_length → 更保守
+                            if ld_x > orig_landing_x:
+                                self.landing_x_cm = ld_x
+                                ld_updated = True
+                                self._log("YOLO", f"YOLO落地点更优({ld_x:.1f} > {orig_landing_x:.1f})，采用YOLO结果")
+
+                            if to_updated or ld_updated:
+                                self.final_distance_cm = max(0.0, self.landing_x_cm - self.takeoff_x_cm)
+
+                            # 始终重保存 takeoff/score 图像以绘制 YOLO 线
+                            if self._takeoff_frame_img is not None:
+                                self._takeoff_saved = False
+                                self._save_takeoff_image(
+                                    self._takeoff_frame_img,
+                                    self._takeoff_kpts,
+                                    self._takeoff_all_kpts_list,
+                                )
+                            # 落地图像由后面的 _save_landed_image(line 1035) 自然重新保存
+                            # 重新保存 score 和 payload
+                            img_base = self._landing_frame_img if self._landing_frame_img is not None else frame
+                            self._score_saved = False
+                            self._save_score_image(img_base)
+                            self._save_payload()
+
                         self._save_diff_image()
                     else:
                         self._log("DIFF", "差分法计算失败（关键点或基准帧不足）")

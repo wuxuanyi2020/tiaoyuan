@@ -28,7 +28,7 @@ def build_parser():
     parser.add_argument("--debug-dir", type=str, default=None)
     parser.add_argument("--record", type=str, default=None, help="录制输出视频路径")
     parser.add_argument("--mat-length-cm", type=float, default=338.0)
-    parser.add_argument("--mat-width-cm", type=float, default=90.0)
+    parser.add_argument("--mat-width-cm", type=float, default=100.0)
     parser.add_argument("--trigger-move-cm", type=float, default=32.0)
     parser.add_argument("--trigger-frames", type=int, default=2)
     parser.add_argument("--min-flight-frames", type=int, default=5)
