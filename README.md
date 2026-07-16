@@ -161,7 +161,7 @@ tiaoyuan/
 ### Skeleton 骨骼关键点法
 
 1. **垫子标定**: HSV 颜色分割自动识别绿色垫子，通过轮廓拟合四边形并计算透视变换矩阵。支持画面顶部 40% 区域屏蔽以滤除天空/树木等绿色噪声，形态学操作使用 9x9 开运算 + 5x5 闭运算去除毛刺
-2. **人体检测**: 通过 MediaPipe PoseLandmarker 获取每帧 33 个骨骼关键点坐标（含脚趾、脚踝、脚后跟）
+2. **人体检测**: 通过 MediaPipe PoseLandmarker Heavy 模型（优先加载，自动从 CDN 下载 `pose_landmarker_heavy.task`，本地安装于 `mediapipe-0.10.35/` 目录；失败时回退到 Legacy Pose）获取每帧 33 个骨骼关键点坐标。支持多人检测（最多 5 人）。关键点索引：脚踝(27,28)、脚后跟(29,30)、脚尖(31,32)
 3. **两阶段入垫检测**:
    - 阶段一：脚尖进入垫子软检测范围（`in_mat()`，±50cm）→ 输出 "检测到人体在垫内" 日志（仅一次）
    - 阶段二：**双脚**脚尖均距起跳线 ≤ 5cm → 输出 "检测预备起跳" 日志，切换至 READY 状态
@@ -172,9 +172,9 @@ tiaoyuan/
    - **稳定期突变**: `stable_before > 35` 后稳定帧数突然归零
    - **脚尖丢失**: 连续 3 帧以上脚尖关键点缺失且位置不移后
    - **离地爆发**(动态复合判定): 脚踝抬升 + 脚尖前移 > 3cm，或脚踝抬升 + 髋部前移 > 70cm + 脚尖因腾空后摆出现回缩 (< -2cm)
-6. **起跳点取值**: 使用触发前一帧的数据倒推，避免触发帧脚已离地前移导致的误差；起跳点可叠加 `takeoff_offset_cm` 修正
+6. **起跳点取值**: 使用触发前一帧的数据倒推，避免触发帧脚已离地前移导致的误差；取基准帧的脚尖 X（垫子坐标 cm）加上 `takeoff_offset_cm` 作为最终起跳点 (`takeoff_x_cm = takeoff_x + takeoff_display_offset_cm`)。在启用 `--yolo` 时，保存骨骼修正值备份至 `_skeleton_takeoff_x_cm`（仅用于图像标注），最终起跳点 `takeoff_x_cm` 被 YOLO 分割结果覆盖
 7. **落地检测**: 脚后跟 Y 坐标触底（V 型谷底模式）+ 连续帧阈值确认
-8. **成绩计算**: `(landing_raw + landing_offset) − (takeoff_raw + takeoff_offset)`
+8. **成绩计算**: `final_distance = max(0, (landing_x_for_dist + landing_offset_cm) - (takeoff_x + takeoff_display_offset_cm))`。其中 `landing_offset_cm`（默认 -5cm）为鞋后跟厚度补偿。启用 `--diff` 时起跳/落地点改用 MOG2 差分值；启用 `--yolo` 时起跳/落地点以 YOLO 实例分割结果为准
 
 ### YOLO 实例分割距离修正（可选）
 
