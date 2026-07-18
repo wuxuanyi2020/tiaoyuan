@@ -132,6 +132,7 @@ class StandingLongJumpSystem:
 
         if config.display:
             cv2.namedWindow("Auto Long Jump", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Auto Long Jump", 1280, 720)
             if self.calibrator.manual_mode:
                 cv2.setMouseCallback("Auto Long Jump", self.calibrator.mouse_callback)
 

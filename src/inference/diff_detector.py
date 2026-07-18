@@ -297,8 +297,8 @@ class DiffDetector:
             # 从全图 Mask 中裁剪出 ROI 区域
             solid_mask = full_mask[y1:y1 + h_roi, x1:x1 + w_roi].copy()
 
-            # 工程 Trick：上半部分（前 40% 高度）置零，只保留贴近地面的鞋子部分
-            solid_mask[0:int(h_roi * 0.4), :] = 0
+            # 工程 Trick：上半部分（前 30% 高度）置零，只保留贴近地面的鞋子部分
+            solid_mask[0:int(h_roi * 0.3), :] = 0
 
             return solid_mask, (x1, y1)
 
@@ -347,8 +347,9 @@ class DiffDetector:
     def _compute_shoe_extreme(self, frame_bgr, kpts, edge_side):
         """对左右脚分别做边缘差分，融合后找鞋子最前/最后边缘。
 
-        边缘差分 Mask 本身就是鞋子轮廓的边缘响应图，
-        Mask 内最极端 X 坐标即为目标边缘（脚尖/脚后跟）。
+        边缘差分 Mask 本身就是鞋子轮廓的边缘响应图。
+        将 Mask 内所有像素经透视变换转到垫子坐标系，
+        在物理空间取 X 极值（避免透视畸变导致像素极值 ≠ 物理极值）。
 
         Args:
             frame_bgr: 当前帧彩色 BGR 图像
@@ -378,15 +379,22 @@ class DiffDetector:
             if len(xs) < 15:
                 continue
 
-            # 边缘差分 Mask 已经是鞋子轮廓，直接在 Mask 内取极值
+            # 将 Mask 内所有像素转换到垫子坐标系，在物理空间取极值（避免透视畸变导致像素极值 ≠ 物理极值）
+            global_pts = np.stack([xs + x1, ys + y1], axis=1).astype(np.float32)  # (N, 2)
+            mat_pts = cv2.perspectiveTransform(
+                global_pts.reshape(-1, 1, 2), self._calib.H_img2mat
+            ).reshape(-1, 2)  # (N, 2)
+            mat_xs = mat_pts[:, 0]
+
             if edge_side == "toe":
-                idx = np.argmax(xs)
+                idx = np.argmax(mat_xs)
             else:
-                idx = np.argmin(xs)
+                idx = np.argmin(mat_xs)
 
             edge_px = (float(xs[idx] + x1), float(ys[idx] + y1))
-            edge_cm = self._calib.transform_to_mat_cm(edge_px)
-            if edge_cm is None or edge_cm[0] < -10 or edge_cm[0] > 360:
+            edge_cm_x = float(mat_xs[idx])
+
+            if edge_cm_x < -10 or edge_cm_x > 360:
                 continue
 
             per_foot.append({
@@ -394,9 +402,9 @@ class DiffDetector:
                 "binary": binary,
                 "origin": (x1, y1),
                 "edge_px": edge_px,
-                "edge_cm": edge_cm[0],
+                "edge_cm": edge_cm_x,
             })
-            all_px_cm.append((edge_cm[0], edge_px))
+            all_px_cm.append((edge_cm_x, edge_px))
 
         if not all_px_cm:
             return None
@@ -443,7 +451,8 @@ class DiffDetector:
             if self.enable_seg:
                 print(f"[YOLO] [{self.yolo_model_label}] 起跳帧推理用时: {elapsed:.3f}s")
             return x_cm
-        except Exception:
+        except Exception as e:
+            print(f"[YOLO] [{self.yolo_model_label}] 起跳帧推理失败: {e}")
             return None
 
     def compute_landing(self):
@@ -461,7 +470,8 @@ class DiffDetector:
             if self.enable_seg:
                 print(f"[YOLO] [{self.yolo_model_label}] 落地帧推理用时: {elapsed:.3f}s")
             return x_cm
-        except Exception:
+        except Exception as e:
+            print(f"[YOLO] [{self.yolo_model_label}] 落地帧推理失败: {e}")
             return None
 
     def compute_combined_distance(self):
@@ -558,9 +568,9 @@ class DiffDetector:
                 col_overlay = col_raw.copy()
                 col_overlay[raw_mask > 0] = (col_overlay[raw_mask > 0] * 0.5 +
                                               np.array([0, 200, 0], dtype=np.uint8) * 0.5).astype(np.uint8)
-                # 列3: 切割上部20%区域的二值 Mask
+                # 列3: 切割上部30%区域的二值 Mask
                 final_mask = raw_mask.copy()
-                final_mask[0:int(h_roi * 0.2), :] = 0
+                final_mask[0:int(h_roi * 0.3), :] = 0
 
                 target_h = 160
                 def _r(img):
@@ -584,11 +594,39 @@ class DiffDetector:
                     cv2.putText(col_final_r, _edge_label, (lx + 8, ly - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, lineType=cv2.LINE_AA)
 
+                # 列4: 二值 Mask 投影到垫子俯视图
+                _H_px = self._calib.get_H_img2mat_px()
+                if _H_px is not None:
+                    _mv_w = int(round(self._calib.mat_length_cm * self._calib.mat_view_scale))
+                    _mv_h = int(round(self._calib.mat_width_cm * self._calib.mat_view_scale))
+                    # 在全图尺寸上构建包含 final_mask 的空白画布
+                    _full_m = np.zeros((h_img, w_img), dtype=np.uint8)
+                    _full_m[y1:y1 + h_roi, x1:x1 + w_roi] = final_mask
+                    # 透视变换到垫子俯视图
+                    _mat_proj = cv2.warpPerspective(_full_m, _H_px, (_mv_w, _mv_h))
+                    # 绘制垫子俯视图
+                    _col_mat = np.full((_mv_h, _mv_w, 3), 36, dtype=np.uint8)
+                    _col_mat[_mat_proj > 0] = (0, 200, 0)
+                    # 标记检测到的边缘点（用透视变换将全图坐标映射到俯视图真实位置）
+                    _edge_px = self._takeoff_edge_px if which == "takeoff" else self._landing_edge_px
+                    if _edge_px is not None:
+                        pt_img = np.array([[[_edge_px[0], _edge_px[1]]]], dtype=np.float32)
+                        pt_mat = cv2.perspectiveTransform(pt_img, _H_px).reshape(-1, 2)[0]
+                        lx_mat = int(round(pt_mat[0]))
+                        ly_mat = int(round(pt_mat[1]))
+                        cv2.circle(_col_mat, (lx_mat, ly_mat), 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+                        cv2.putText(_col_mat, _edge_label, (lx_mat + 8, ly_mat - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, lineType=cv2.LINE_AA)
+                    col_mat_r = _r(_col_mat)
+                else:
+                    col_mat_r = np.zeros((target_h, 60, 3), dtype=np.uint8)
+
                 tag_h = 28
                 imgs_tagged = []
                 for img, t in [(col_raw_r, "Raw_ROI"),
                                (col_overlay_r, "Mask_Overlay"),
-                               (col_final_r, "FinalMask")]:
+                               (col_final_r, "FinalMask"),
+                               (col_mat_r, "Mat_Projection")]:
                     tb = np.zeros((tag_h, img.shape[1], 3), dtype=np.uint8)
                     cv2.putText(tb, t, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                     imgs_tagged.append(np.vstack([tb, img]))
@@ -604,12 +642,12 @@ class DiffDetector:
 
             collage = cv2.vconcat(strips)
             title_h = 50
-            right_pad = 100  # 右侧留白，确保标题显示完整
+            right_pad = 100
             canvas = np.zeros((title_h + collage.shape[0], collage.shape[1] + right_pad, 3), dtype=np.uint8)
             canvas[title_h:, :collage.shape[1]] = collage
             canvas = self._put_text_cn(
                 canvas,
-                f"Stage3 - YOLO ({label}): Raw_ROI → Mask_Overlay(绿) → FinalMask(上部20%切割)",
+                f"Stage3 - YOLO ({label}): Raw_ROI → Mask_Overlay → FinalMask → Mat_Projection(俯视)",
                 (20, 6), (255, 255, 255), size=22)
             return canvas
 
