@@ -1,248 +1,325 @@
 # 立定跳远自动检测系统
 
-基于 OpenCV + MediaPipe 骨骼关键点（Skeleton）的立定跳远成绩自动检测系统。支持视频输入，自动识别垫子区域、检测起跳/落地点、计算距离、判定犯规。可选 YOLO 实例分割或 MOG2 差分法距离修正。
+基于 OpenCV + MediaPipe 骨骼关键点的立定跳远视频自动检测系统。程序会自动标定绿色跳远垫，建立图像坐标到垫子物理坐标（cm）的透视变换，识别起跳/落地事件，计算成绩，并可进行犯规判定。距离精修可选 MOG2 差分或 YOLO 实例分割。
 
-## 功能特性
+> 当前 README 按 `main.py` 和 `src/` 下的实际代码整理。命令行默认值以 `main.py --help` 为准；`src/config.py` 中的 dataclass 默认值主要用于代码级调用。
 
-- **自动标定**: 通过 HSV 颜色分割、水平闭运算和边缘线拟合自动识别绿色跳远垫子，生成透视变换矩阵；支持手动四点标定；新增 HDR/强光视频自适应，减少 SDR 截图与 HDR 原视频亮度差导致的垫子外扩
-- **骨骼关键点检测**: 基于 MediaPipe 33 点骨骼，通过脚尖位移、髋部移动和脚踝离地判定起跳，通过脚后跟 Y 坐标触底检测落地
-- **YOLO 实例分割距离修正** (可选): 支持 YOLOv8/v11/v26 多种尺度（n/s/m/l/x）的实例分割模型，从基准帧与起跳/落地帧的脚部 ROI 精确提取鞋子边缘位置。Stage3 输出四列可视化：Raw_ROI（原图ROI）、Mask_Overlay（原图+半透明绿色Mask叠加）、FinalMask（上部30%切割二值图，标注检测到的脚尖/脚跟位置）、Mat_Projection（二值 Mask 投影到垫子俯视图，标注检测到的边缘点）
-- **MOG2 差分法距离修正** (可选): 基于背景建模 + 轮廓实心填充的备选修正方案（`--diff`）
-- **ROI 分辨率自适应**: ROI 尺寸基于图像短边百分比计算，1080p 与 4K 视频的 ROI 覆盖物理区域一致，无需额外调参
-- **智能起跳判定**: 综合脚尖位移、髋部前移、脚踝抬升、关键点丢失、稳定期突变等多维度判定，区分真实起跳与蓄力动作
-- **犯规检测**: 踩线、垫步、单脚起跳、多人入界、出界、撑杆辅助
-- **结果可视化**: 起跳帧/落地帧/成绩三张标注图、YOLO/差分过程图、垫子实心四边形 mask、四边形内可见颜色 mask、垫子毫米格测试图
-- **批量处理**: 支持一次性跑多段视频并生成汇总 CSV
+## 主要功能
 
-## 环境要求
+- **自动垫子标定**：默认使用 HSV 绿色/强光低饱和高亮区域提案 + 形态学补全 + 四边形候选评分 + 边缘线拟合，输出透视矩阵。支持 `--manual-calib` 手动四点标定。
+- **HDR/强光适配**：针对 HDR 原视频比 SDR 截图更亮、饱和度更低的问题，检测到强光特征且四边形透视比例异常时，会自动用更严格的色相下界重检，避免垫子范围外扩。
+- **MediaPipe 骨骼检测**：优先使用 PoseLandmarker Heavy（33 点骨骼，最多 5 人），失败时回退到 Legacy Pose。支持视频/摄像头输入，也支持单张图片输入用于调试。
+- **起跳/落地检测**：通过脚尖、脚踝、脚后跟、髋部关键点在垫子坐标系中的变化判断 READY/JUMPING/LANDED 状态。
+- **距离修正（可选）**：
+  - `--yolo VERSION SCALE`：使用 YOLO 实例分割 person mask，在脚部 ROI 内提取脚尖/脚跟物理 X 极值修正距离。
+  - `--diff`：使用 MOG2 背景差分作为备选修正方式。
+  - 同时传入 `--yolo` 和 `--diff` 时，代码优先启用 YOLO，`--diff` 会被关闭。
+- **犯规检测**：支持踩线、垫步/单脚异常、多人入界、出界、撑杆辅助等规则；可用 `--no-foul-detection` 关闭。
+- **可视化输出**：保存起跳帧、落地帧、最终成绩图、犯规图、垫子 mask、测试网格、YOLO/MOG2 各阶段调试图和运行日志。
+- **批量处理**：支持默认批量跑 `videos/跳远1-1.mp4` 到 `videos/跳远1-9.mp4`，或通过 `--videos` 指定列表，并生成汇总 CSV。
 
-- Python 3.10+
-- conda 环境（推荐）
+## 目录结构
 
-## 安装
+```text
+tiaoyuan/
+├── main.py                         # CLI 入口；单视频/批量处理
+├── README.md
+├── src/
+│   ├── config.py                   # JumpConfig、视频源解析、结果目录创建
+│   ├── core/
+│   │   └── jump_system.py          # 主状态机、成绩计算、结果保存
+│   ├── inference/
+│   │   ├── mat_calibration.py      # 垫子自动/手动标定与 mask 输出
+│   │   ├── pose_estimator.py       # MediaPipe 骨骼检测封装
+│   │   ├── diff_detector.py        # MOG2/YOLO 距离修正与阶段图
+│   │   ├── shoe_detector.py        # 传统鞋边缘检测模块（当前主流程未作为核心修正方式）
+│   │   └── shadow_remover.py       # HomoFormer 阴影移除封装（当前 CLI 未直接接入）
+│   ├── rules/
+│   │   └── foul_detection.py       # 犯规规则
+│   └── visualization/
+│       └── rendering.py            # 标注绘制、中文文字、图片保存
+├── videos/                         # 本地视频目录（被 .gitignore 忽略）
+├── yolo_model/                     # YOLO seg 模型目录（*.pt 被 .gitignore 忽略）
+└── result/                         # 运行输出目录（被 .gitignore 忽略）
+```
+
+## 环境安装
+
+推荐使用 Python 3.10+（当前开发环境使用 Python 3.12）。
 
 ```bash
-# 创建 conda 环境
 conda create -n tiaoyuan python=3.12 -y
 conda activate tiaoyuan
 
-# 安装依赖（清华源）
 pip install opencv-python numpy mediapipe Pillow -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 如需 YOLO 实例分割功能
+# 如需 YOLO 实例分割修正
 pip install ultralytics -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-首次运行时会自动下载 MediaPipe 骨骼模型 (`pose_landmarker_heavy.task`，约 29MB)，缓存于 `~/.mediapipe/`。
+首次运行 MediaPipe PoseLandmarker 时，程序会自动下载 `pose_landmarker_heavy.task` 到用户目录 `~/.mediapipe/`。如果自动下载失败，请手动下载该模型并放到对应目录。
 
-YOLO 模型（如 `yolo11x-seg.pt`）需下载后放入项目根目录的 `yolo_model/` 文件夹。
+YOLO 模型请放在项目根目录的 `yolo_model/` 下，文件名由版本和尺度决定：
+
+| 命令 | 期望模型文件 |
+|---|---|
+| `--yolo 8 x` | `yolo_model/yolov8x-seg.pt` |
+| `--yolo 11 x` | `yolo_model/yolo11x-seg.pt` |
+| `--yolo 26 x` | `yolo_model/yolo26x-seg.pt` |
+
+支持尺度：`n`、`s`、`m`、`l`、`x`。支持版本：`8`、`11`、`26`。
 
 ## 快速开始
 
 ### 单视频处理
 
 ```bash
-# 纯骨骼关键点法（无距离修正）
+# 骨骼关键点基础流程
 python main.py --video videos/跳远1-1.mp4 --no-display
 
-# 启用 YOLOv11x-seg 距离修正（与 --diff 互斥）
-python main.py --yolo 11 x --video videos/跳远1-1.mp4 --no-display
+# 启用 YOLOv26x 实例分割距离修正
+python main.py --video videos/跳远1-16.mp4 --yolo 26 x --no-display
 
-# 启用 MOG2 差分法距离修正（与 --yolo 互斥）
-python main.py --diff --video videos/跳远1-1.mp4 --no-display
+# 启用 MOG2 差分修正
+python main.py --video videos/跳远1-1.mp4 --diff --no-display
 
-# 强光/HDR 场景建议同时输出垫子调试图，检查 mat_mask_quad、mat_mask_hsv 和 test_grid
-python main.py --video videos/跳远1-16.MP4 --yolo 26 x --enable-mat-output --test-grid --no-display
+# 强光/HDR 场景：额外输出垫子 mask 与网格图，检查标定是否贴合垫子边界
+python main.py --video videos/跳远1-16.mp4 --yolo 26 x --enable-mat-output --test-grid --no-display
 ```
 
 ### 批量处理
 
 ```bash
-# 跑 videos/ 下跳远1-1 ~ 跳远1-9
+# 默认处理 videos/跳远1-1.mp4 ~ videos/跳远1-9.mp4
 python main.py --batch --no-display
 
-# 跑指定视频
-python main.py --videos 跳远1-1.mp4 跳远1-2.mp4 --no-display
+# 指定文件名（相对路径会自动从 videos/ 下查找）
+python main.py --videos 跳远1-9-1080p.mp4 跳远1-14.mp4 跳远1-16.mp4 --yolo 26 x --enable-mat-output --test-grid --no-display
+
+# 也可以传绝对路径
+python main.py --videos D:/data/a.mp4 D:/data/b.mp4 --no-display
 ```
 
-### 预览模式
+### 预览与录制
 
 ```bash
-# 带窗口预览（按 q 退出）
+# 打开预览窗口，按 q 退出
 python main.py --video videos/跳远1-1.mp4
+
+# 保存带标注的视频
+python main.py --video videos/跳远1-1.mp4 --record result/preview.mp4
 ```
 
 ## 命令行参数
 
 | 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--video` | `0` | 视频路径或摄像头索引 |
-| `--batch` | - | 批量处理 `videos/` 下跳远1-1 ~ 跳远1-9 |
-| `--videos` | - | 批量处理指定视频列表 |
-| `--no-display` | - | 不显示预览窗口 |
-| `--mat-length-cm` | `338.0` | 垫子长度 (cm) |
-| `--mat-width-cm` | `100.0` | 垫子宽度 (cm) |
-| `--takeoff-line-cm` | `31.0` | 起跳线位置 (cm) |
-| `--takeoff-offset-cm` | `3.0` | 起跳点偏移修正 (cm) |
-| `--trigger-move-cm` | `30.0` | 脚尖前移触发起跳阈值 (cm) |
-| `--landing-offset-cm` | `-5.0` | 落地点修正 (cm，补偿鞋跟厚度) |
-| `--manual-calib` | - | 手动四点标定（鼠标点击） |
-| `--no-foul-detection` | - | 禁用犯规检测 |
-| `--diff` | - | 启用 MOG2 背景差分法距离修正（与 `--yolo` 互斥） |
-| `--yolo VERSION SCALE` | - | 启用 YOLO 实例分割距离修正（与 `--diff` 互斥），如 `--yolo 26 x`。YOLO 起跳点更靠近垫子边界（更保守）时自动覆盖骨骼修正值 |
-| `--enable-mat-output` | - | 输出垫子识别图：`mat_mask_quad.jpeg` 为实心四边形 mask，`mat_mask_hsv.jpeg` 为四边形内可见颜色区域 |
-| `--test-grid` | - | 输出垫子毫米格测试图（起跳线外每 10cm 画一条绿线） |
-| `--debug` | - | 调试模式：每帧记录 IDLE/READY/JUMPING 各状态的全量判定参数到运行日志 |
+|---|---:|---|
+| `--video` | `0` | 视频文件路径或摄像头索引；不存在时会回退到摄像头 0 |
+| `--save` | `result.json` | 兼容参数；当前通过 CLI 正常运行时结果会写到自动创建的结果目录中的 `result.json` |
+| `--no-display` | 关闭 | 不显示 OpenCV 预览窗口；批量处理中单个视频固定不显示 |
+| `--backend` | `mediapipe` | 骨骼检测后端参数，目前实际实现为 MediaPipe |
+| `--debug-dir` | 空 | 兼容/预留参数，传入 `JumpConfig` |
+| `--record` | 空 | 保存显示画面的 MP4 路径 |
+| `--mat-length-cm` | `338.0` | 垫子长度，单位 cm |
+| `--mat-width-cm` | `100.0` | 垫子宽度，单位 cm |
+| `--trigger-move-cm` | `32.0` | 脚尖前移触发起跳的主要阈值，单位 cm |
+| `--trigger-frames` | `2` | 起跳触发需要满足的帧数参数 |
+| `--min-flight-frames` | `5` | 最短腾空/跳跃帧数约束 |
+| `--max-jump-frames` | `120` | 最大跳跃帧数，超出后按超时落地处理 |
+| `--takeoff-line-cm` | `31.0` | 起跳线在垫子坐标系中的 X 位置 |
+| `--takeoff-offset-cm` | `3.0` | 起跳点显示/成绩计算偏移补偿 |
+| `--manual-calib` | 关闭 | 手动点击 4 个角点进行垫子标定 |
+| `--no-foul-detection` | 关闭 | 关闭犯规检测 |
+| `--landing-offset-cm` | `-5.0` | 落地点补偿，默认负值用于缩短鞋跟厚度带来的偏差 |
+| `--debug` | 关闭 | 输出更详细的 READY/JUMPING 触发日志 |
+| `--diff` | 关闭 | 启用 MOG2 背景差分修正；若同时传 `--yolo`，则 YOLO 优先 |
+| `--yolo VERSION SCALE` | 空 | 启用 YOLO 实例分割修正，如 `--yolo 26 x` |
+| `--enable-mat-output` | 关闭 | 输出 `mat_mask_quad.jpeg` 和 `mat_mask_hsv.jpeg` |
+| `--test-grid` | 关闭 | 输出 `test_grid.jpeg`，用于检查厘米坐标映射 |
+| `--batch` | 关闭 | 批量处理默认视频 `跳远1-1` 到 `跳远1-9` |
+| `--videos` | 空 | 批量处理指定视频列表 |
 
-## 输出结构
+## 输出结果
 
-```
+每次运行都会创建带时间戳的结果目录：
+
+```text
 result/
 └── <视频名>/
-    └── <视频名>_<时间戳>/
-        ├── result.json                # 结构化结果
+    └── <视频名>_<YYYYMMDD_HHMMSS>/
+        ├── result.json
         ├── images/
-        │   ├── mat_mask_quad.jpeg         # 垫子识别图（四边形拟合）
-        │   ├── mat_mask_hsv.jpeg          # 垫子识别图（HSV 原始）
-        │   ├── test_grid.jpeg             # 垫子毫米格测试图
-        │   ├── takeoff.jpeg               # 起跳帧标注图（limit + fixed corrected + yolo corrected）
-        │   ├── landed.jpeg                # 落地帧标注图（limit + fixed corrected + yolo corrected）
-        │   ├── score.jpeg                 # 成绩汇总图（起跳线+落地线+测量线）
-        │   ├── foul-*.jpeg                # 犯规截图
-        │   ├── diff/                       # MOG2 差分过程图（需 --diff）
-        │   └── yolo/                        # YOLO seg 过程图（需 --yolo）
+        │   ├── takeoff.jpeg                 # 起跳帧标注图
+        │   ├── landed.jpeg                  # 落地帧标注图
+        │   ├── score.jpeg                   # 最终成绩图
+        │   ├── foul-<timestamp>.jpeg        # 犯规截图（如触发）
+        │   ├── mat_mask_quad.jpeg           # --enable-mat-output：最终实心四边形 mask
+        │   ├── mat_mask_hsv.jpeg            # --enable-mat-output：四边形内可见颜色 mask
+        │   ├── test_grid.jpeg               # --test-grid：垫子边框、起跳线、10cm 网格
+        │   ├── yolo/                        # --yolo：YOLO 各阶段调试图
+        │   └── diff/                        # --diff：MOG2 各阶段调试图
         └── logs/
-            ├── run_<时间戳>.log         # 运行日志
-            └── keypoints_<时间戳>.log   # 关键点帧数据
+            ├── run_<timestamp>.log          # 运行状态日志
+            └── keypoints_<timestamp>.log    # 每帧关键点日志
 ```
 
-输出图像标注说明：
+批量模式还会生成：
 
-| 图像 | 内容 |
-|------|------|
-| `takeoff.jpeg` | `limit` 白色标准起跳线 + `fixed corrected` 黄色骨骼修正起跳点/线 + `yolo corrected` 绿色 YOLO 修正起跳点/线（`--yolo` 时） |
-| `landed.jpeg` | `limit` 白色标准起跳线 + `fixed corrected` 红色骨骼修正落地点/线 + `yolo corrected` 绿色 YOLO 修正落地点/线（`--yolo` 时） |
-| `score.jpeg` | 所有线（limit 白、fixed corrected 黄/红、yolo corrected 绿）+ 绿色测量连线 |
-
-`result.json` 格式:
-
-```json
-{
-  "score": 173.1,
-  "valid": true,
-  "foul_reason": null,
-  "distance_cm": 173.1,
-  "takeoff_x_cm": 30.8,
-  "landing_x_cm": 203.9
-}
+```text
+result/summary_<YYYYMMDD_HHMMSS>.csv
 ```
 
-## 项目结构
+`result.json` 字段：
 
-```
-tiaoyuan/
-├── main.py                          # 主入口 & 批量处理
-├── yolo_model/                      # YOLO 模型文件（*.pt，不纳入版本管理）
-├── src/
-│   ├── config.py                    # 配置数据结构 & 路径工具
-│   ├── core/
-│   │   └── jump_system.py           # 核心状态机 (IDLE→READY→JUMPING→LANDED)
-│   ├── inference/
-│   │   ├── mat_calibration.py       # MatCalibrator: 垫子标定 & 透视变换
-│   │   ├── shoe_detector.py         # ShoeEdgeDetector: ROI 鞋子边缘检测
-│   │   ├── diff_detector.py         # DiffDetector: 差分法/YOLO 距离修正
-│   │   └── pose_estimator.py        # PoseEstimator: MediaPipe 姿态推理
-│   ├── rules/
-│   │   └── foul_detection.py        # FoulDetector: 犯规规则引擎
-│   └── visualization/
-│       └── rendering.py             # Renderer: 可视化绘制工具
-└── videos/                          # 视频文件（不纳入版本管理）
-```
+| 字段 | 含义 |
+|---|---|
+| `score` | 最终成绩，单位 cm，与 `distance_cm` 保持一致 |
+| `valid` | 是否有效；存在犯规原因时为 `false` |
+| `foul_reason` | 犯规原因；无犯规时为 `null` |
+| `distance_cm` | 最终距离，单位 cm |
+| `takeoff_x_cm` | 起跳点在垫子坐标系中的 X 坐标 |
+| `landing_x_cm` | 落地点在垫子坐标系中的 X 坐标 |
+| `yolo_infer_time_s` | YOLO 推理累计耗时；未启用 YOLO 时通常为 0 |
 
-## 检测原理
+## 垫子标定逻辑
 
-### Skeleton 骨骼关键点法
+`src/inference/mat_calibration.py` 是垫子范围标定的核心模块。当前自动标定流程：
 
-1. **垫子标定**: HSV 颜色分割自动识别绿色垫子，结合低饱和强光补全、水平长核闭运算、轮廓四边形拟合和 Hough/Canny 边缘线微调，计算透视变换矩阵。默认屏蔽画面顶部 50% 以滤除天空/树木等绿色噪声；`render_mask()` 输出实心垫子四边形，`render_visible_mask()` 输出四边形内可见颜色区域。针对 HDR 原视频比 SDR 截图更亮、饱和度更低的情况，检测到强光/HDR 且四边形透视比例异常时，会自动使用更严格的色相下界重检，避免垫子左上角外扩
-2. **人体检测**: 通过 MediaPipe PoseLandmarker Heavy 模型（优先加载，自动从 CDN 下载 `pose_landmarker_heavy.task`，本地安装于 `mediapipe-0.10.35/` 目录；失败时回退到 Legacy Pose）获取每帧 33 个骨骼关键点坐标。支持多人检测（最多 5 人）。关键点索引：脚踝(27,28)、脚后跟(29,30)、脚尖(31,32)
-3. **两阶段入垫检测**:
-   - 阶段一：脚尖进入垫子范围（`in_mat()`，垫子内 `0 ≤ x ≤ mat_length`，`0 ≤ y ≤ mat_width`）→ 输出 "检测到人体在垫内" 日志（仅一次）
-   - 阶段二：**双脚**脚尖均距起跳线 ≤ 5cm → 输出 "检测预备起跳" 日志，切换至 READY 状态
-4. **站立稳定期**: 稳定站立阶段（脚尖位移 < 6cm）记录脚尖基线 X 和脚踝 Y 基线（EMA 指数平滑更新），稳定帧数积累
-5. **起跳判定**（满足任一）:
-   - **脚尖大幅前移**: `toe_moved > max(trigger_move_cm, 30.0)`
-   - **重心前冲**: `hip_moved > 35cm 且 toe_moved > 10cm`
-   - **稳定期突变**: `stable_before > 35` 后稳定帧数突然归零
-   - **脚尖丢失**: 连续 3 帧以上脚尖关键点缺失且位置不移后
-   - **离地爆发**(动态复合判定): 脚踝抬升 + 脚尖前移 > 3cm，或脚踝抬升 + 髋部前移 > 70cm + 脚尖因腾空后摆出现回缩 (< -2cm)
-6. **起跳点取值**: 使用触发前一帧的数据倒推，避免触发帧脚已离地前移导致的误差；取基准帧的脚尖 X（垫子坐标 cm）加上 `takeoff_offset_cm` 作为最终起跳点 (`takeoff_x_cm = takeoff_x + takeoff_display_offset_cm`)。在启用 `--yolo` 时，保存骨骼修正值备份至 `_skeleton_takeoff_x_cm`（仅用于图像标注），最终起跳点 `takeoff_x_cm` 被 YOLO 分割结果覆盖
-7. **落地检测**: 脚后跟 Y 坐标触底（V 型谷底模式）+ 连续帧阈值确认
-8. **成绩计算**: `final_distance = max(0, (landing_x_for_dist + landing_offset_cm) - (takeoff_x + takeoff_display_offset_cm))`。其中 `landing_offset_cm`（默认 -5cm）为鞋后跟厚度补偿。启用 `--diff` 时起跳/落地点改用 MOG2 差分值；启用 `--yolo` 时起跳/落地点以 YOLO 实例分割结果为准
+1. 对下半画面进行颜色提案，屏蔽画面上方 50% 以减少背景干扰。
+2. HSV 中提取绿色区域，同时合并强光下低饱和高亮的垫子可见区域。
+3. 使用开运算/闭运算清理噪点，并用较长的水平闭运算补齐边角、锯齿、反光、人体遮挡造成的断裂。
+4. 从检测 mask 中找长条候选轮廓，按面积、长宽比、位置评分。
+5. 对候选轮廓做凸包/四边形近似，必要时使用 `minAreaRect`。
+6. 用 Canny + Hough 边缘线进一步细化四条边，再生成最终四边形。
+7. 将最终四边形映射到 `mat_length_cm × mat_width_cm` 的物理坐标系。
+8. 强光/HDR 帧中若出现“上边宽度接近下边宽度”的外扩形态，会用更严格 `hue_low=26` 重检，并在面积和透视比例满足约束时替换结果。
 
-### YOLO 实例分割距离修正（可选）
+调试时建议同时打开：
 
-通过全图 YOLO 推理获取 person 二值 Mask，结合脚部关键点 ROI 裁剪，精确提取鞋子边缘位置：
-
-```
-流程: 全图 YOLO 推理 → person 二值 Mask → 脚部关键点 ROI 裁剪 → 像素透视变换到垫子坐标系 → 物理空间取 X 极值
-```
-
-边缘提取优化：将所有 Mask 内像素经透视变换转到垫子坐标系，在物理空间取 X 极值（脚尖最大/脚跟最小），避免透视畸变导致像素极值 ≠ 物理极值。
-
-YOLO 结果与骨骼关键点修正值自动对比，取更保守值：
-- **起跳**：YOLO 脚尖 X 更靠近 0（垫子边界）→ 采用 YOLO 值作为最终起跳点
-- **落地**：YOLO 脚跟 X 更靠近 `mat_length`（垫子末端）→ 采用 YOLO 值作为最终落地点
-- 输出图像中分别用绿色 `yolo corrected` 和黄色/红色 `fixed corrected` 标注两条线
-
-支持的模型组合：
-
-| 版本 | 可选尺度 | 示例模型 |
-|------|---------|---------|
-| YOLOv8 | n/s/m/l/x | yolov8x-seg.pt |
-| YOLOv11 | n/s/m/l/x | yolo11x-seg.pt |
-| YOLOv26 | n/s/m/l/x | yolo26x-seg.pt |
-
-运行示例：
 ```bash
-# YOLOv11x-seg（默认推荐）
-python main.py --yolo 11 x --video videos/跳远1-1.mp4 --no-display
-
-# YOLOv26n-seg（轻量快速）
-python main.py --yolo 26 n --video videos/跳远1-1.mp4 --no-display
-
-# YOLOv8m-seg（平衡模式）
-python main.py --yolo 8 m --video videos/跳远1-1.mp4 --no-display
+python main.py --video videos/跳远1-16.mp4 --enable-mat-output --test-grid --no-display
 ```
 
-### DiffDetector 差分法距离修正（可选）
+检查重点：
 
-利用无人体时的基准帧与起跳/落地帧的对比，提取鞋子精确位置：
+- `mat_mask_quad.jpeg`：真正用于坐标标定的最终实心四边形。找最大矩形/坐标转换依赖的是这个最终 quad，而不是原始 HSV 可见 mask。
+- `mat_mask_hsv.jpeg`：最终四边形内部的可见颜色区域，用于观察反光、缺角、低饱和区域是否被识别。
+- `test_grid.jpeg`：最直观检查垫子边界、起跳线和 10cm 网格是否贴合真实垫子。
 
+## 主流程说明
+
+```text
+读取视频/图片
+  ↓
+垫子自动或手动标定，建立 H_img2mat / H_mat2img
+  ↓
+MediaPipe 检测人体关键点
+  ↓
+IDLE：等待人体进入垫子并靠近起跳线
+  ↓
+READY：记录稳定站立基线，检测脚尖/髋部/脚踝突变
+  ↓
+JUMPING：确认起跳，保存起跳帧，等待脚后跟触底/超时
+  ↓
+落地后计算骨骼基础成绩
+  ↓
+可选 YOLO 或 MOG2 修正起跳/落地 X
+  ↓
+犯规判定、保存 result.json 和可视化图片
 ```
-流程: 基准帧 → MOG2 前景 → 二值化 → 轮廓填充 → 脚尖/脚后跟 X
+
+### 起跳判定（概要）
+
+代码会综合以下信号，而不是只看单一阈值：
+
+- 脚尖前移超过 `trigger_move_cm` 或保底阈值。
+- 髋部明显前冲并伴随脚尖移动。
+- 稳定站立帧数积累后突然失稳。
+- 脚尖关键点连续丢失且位置变化符合离地过程。
+- 脚踝抬升、脚尖回缩、髋部前移等离地爆发组合条件。
+
+起跳点会尽量使用触发前的稳定基准帧，避免触发帧脚已经前移导致成绩偏短。
+
+### 落地判定（概要）
+
+落地主要通过脚后跟关键点的 Y 方向触底形态、连续帧确认和最大跳跃帧数兜底判断。最终距离计算会应用 `landing_offset_cm` 鞋跟补偿。
+
+## YOLO 实例分割修正
+
+启用 `--yolo VERSION SCALE` 后，`src/inference/diff_detector.py` 会加载 `yolo_model/` 下对应的 `*-seg.pt` 模型，并对起跳/落地帧进行 person mask 推理。核心思路：
+
+```text
+全图 YOLO 推理 → person mask → 脚部 ROI 裁剪 → 上部遮挡过滤/轮廓清理 → 像素投影到垫子坐标系 → 取物理 X 极值
 ```
+
+输出目录 `images/yolo/` 中会包含：
+
+- `yolo-Stage1-seg-takeoff.jpeg` / `yolo-Stage1-seg-landing.jpeg`
+- `yolo-Stage2-roi-takeoff.jpeg` / `yolo-Stage2-roi-landing.jpeg`
+- `yolo-Stage3-mask-takeoff.jpeg` / `yolo-Stage3-mask-landing.jpeg`
+- `yolo-Stage4-takeoff.jpeg` / `yolo-Stage4-landing.jpeg` / `yolo-Stage4-combined.jpeg`
+
+YOLO 修正值会覆盖骨骼基础取值；保存的标注图中会同时保留骨骼/修正线索，便于对比。
+
+## MOG2 差分修正
+
+启用 `--diff` 后，程序会在垫子标定完成且垫子内无人体关键点时捕获基准帧，然后对起跳/落地帧做背景差分和脚部 ROI 边缘提取。输出目录为 `images/diff/`，文件名前缀为 `diff-Stage*.jpeg`。
 
 ## 犯规规则
 
-| 规则 | 检测方式 |
+| 规则 | 当前检测方式概要 |
 |---|---|
-| 踩线 | 起跳点 X > 起跳线 + 1cm |
-| 垫步 | 起跳前脚尖前移 > 10cm / 双脚 X/Y 差 > 阈值 |
-| 单脚起跳 | 双脚踝 X/Y 差异过大 |
-| 多人入界 | 垫子内同时检测到 ≥ 2 人 |
-| 出界 | 落地点 Y 超出垫子宽度 |
-| 撑杆辅助 | 手腕 Y 低于膝盖 Y |
+| 踩线 | 起跳点 X 超过起跳线容差 |
+| 垫步/起跳前异常 | 起跳前脚尖历史位移过大 |
+| 单脚起跳异常 | 双脚脚踝 X/Y 差异过大 |
+| 多人入界 | 垫子范围内同时检测到多个人体关键点 |
+| 出界 | 落地点 Y 超出垫子宽度范围 |
+| 撑杆/手部辅助 | 手腕位置低于膝盖等异常姿态 |
 
-## 调试输出说明
+如当前任务只需要测距、不需要规则判定，可使用：
 
-启用 `--enable-mat-output` 后会在本次结果目录的 `images/` 下保存：
+```bash
+python main.py --video videos/跳远1-1.mp4 --no-foul-detection --no-display
+```
 
-- `mat_mask_quad.jpeg`：最终用于坐标标定的实心四边形垫子 mask。
-- `mat_mask_hsv.jpeg`：HSV/强光颜色提案在最终四边形内的可见区域，用于排查反光、阴影和 HDR/SDR 色彩差异。
+## 常见问题
 
-启用 `--test-grid` 后会额外保存：
+### 1. HDR 原视频和 SDR 截图标定不一致
 
-- `test_grid.jpeg`：原图叠加垫子边框、起跳线和 10cm 间隔网格，建议强光/HDR 场景优先检查这张图。
+HDR 视频经 OpenCV 解码后可能更亮、更低饱和，导致普通 HSV 阈值把垫子外侧黄绿/灰白区域也合进来。当前代码已经加入强光/HDR 自适应；如果仍有偏差，请先输出 `test_grid.jpeg`，以最终网格是否贴合为准。
+
+```bash
+python main.py --video videos/跳远1-16.mp4 --enable-mat-output --test-grid --no-display
+```
+
+### 2. `mat_mask_hsv.jpeg` 边角缺失是否一定有问题？
+
+不一定。`mat_mask_hsv.jpeg` 是可见颜色区域，边角受圆角、反光、锯齿、遮挡影响会有缺失；最终坐标标定看 `mat_mask_quad.jpeg` 和 `test_grid.jpeg`。
+
+### 3. 找不到 YOLO 模型
+
+确认模型文件位于项目根目录 `yolo_model/` 下，并与命令匹配。例如 `--yolo 26 x` 需要 `yolo_model/yolo26x-seg.pt`。模型文件体积较大，默认不会提交到 Git。
+
+### 4. Windows 命令行中文乱码
+
+代码和 README 均为 UTF-8。部分 Windows cmd 窗口显示 `main.py --help` 时可能乱码，但不影响日志文件和结果 JSON。可以尝试使用支持 UTF-8 的终端。
+
+### 5. 结果目录或视频没有上传到仓库
+
+`.gitignore` 会忽略 `result/`、`videos/`、`*.pt`、MediaPipe/HomoFormer 外部目录和备份目录，避免把大文件或本地依赖提交到 GitHub。
+
+## 代码检视清单
+
+本 README 对应的代码检视范围：
+
+- `main.py`：CLI 参数、单视频/批量入口、结果目录与 CSV 汇总。
+- `src/config.py`：运行配置、视频源解析、结果目录创建。
+- `src/core/jump_system.py`：状态机、起跳/落地、YOLO/MOG2 修正接入、输出文件。
+- `src/inference/mat_calibration.py`：垫子自动标定、HDR/强光适配、mask/grid 输出。
+- `src/inference/pose_estimator.py`：MediaPipe 模型下载、视频/图片读取、多人关键点。
+- `src/inference/diff_detector.py`：YOLO 模型路径、实例分割/MOG2 调试图和距离修正。
+- `src/rules/foul_detection.py`：犯规规则。
+- `src/visualization/rendering.py`：图像标注和中文路径安全保存。
 
 ## License
 
