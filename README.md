@@ -4,14 +4,14 @@
 
 ## 功能特性
 
-- **自动标定**: 通过 HSV 颜色分割自动识别绿色跳远垫子，生成透视变换矩阵；支持手动四点标定
+- **自动标定**: 通过 HSV 颜色分割、水平闭运算和边缘线拟合自动识别绿色跳远垫子，生成透视变换矩阵；支持手动四点标定；新增 HDR/强光视频自适应，减少 SDR 截图与 HDR 原视频亮度差导致的垫子外扩
 - **骨骼关键点检测**: 基于 MediaPipe 33 点骨骼，通过脚尖位移、髋部移动和脚踝离地判定起跳，通过脚后跟 Y 坐标触底检测落地
 - **YOLO 实例分割距离修正** (可选): 支持 YOLOv8/v11/v26 多种尺度（n/s/m/l/x）的实例分割模型，从基准帧与起跳/落地帧的脚部 ROI 精确提取鞋子边缘位置。Stage3 输出四列可视化：Raw_ROI（原图ROI）、Mask_Overlay（原图+半透明绿色Mask叠加）、FinalMask（上部30%切割二值图，标注检测到的脚尖/脚跟位置）、Mat_Projection（二值 Mask 投影到垫子俯视图，标注检测到的边缘点）
 - **MOG2 差分法距离修正** (可选): 基于背景建模 + 轮廓实心填充的备选修正方案（`--diff`）
 - **ROI 分辨率自适应**: ROI 尺寸基于图像短边百分比计算，1080p 与 4K 视频的 ROI 覆盖物理区域一致，无需额外调参
 - **智能起跳判定**: 综合脚尖位移、髋部前移、脚踝抬升、关键点丢失、稳定期突变等多维度判定，区分真实起跳与蓄力动作
 - **犯规检测**: 踩线、垫步、单脚起跳、多人入界、出界、撑杆辅助
-- **结果可视化**: 起跳帧/落地帧/成绩三张标注图、YOLO/差分过程图、垫子毫米格测试图
+- **结果可视化**: 起跳帧/落地帧/成绩三张标注图、YOLO/差分过程图、垫子实心四边形 mask、四边形内可见颜色 mask、垫子毫米格测试图
 - **批量处理**: 支持一次性跑多段视频并生成汇总 CSV
 
 ## 环境要求
@@ -50,6 +50,9 @@ python main.py --yolo 11 x --video videos/跳远1-1.mp4 --no-display
 
 # 启用 MOG2 差分法距离修正（与 --yolo 互斥）
 python main.py --diff --video videos/跳远1-1.mp4 --no-display
+
+# 强光/HDR 场景建议同时输出垫子调试图，检查 mat_mask_quad、mat_mask_hsv 和 test_grid
+python main.py --video videos/跳远1-16.MP4 --yolo 26 x --enable-mat-output --test-grid --no-display
 ```
 
 ### 批量处理
@@ -87,7 +90,7 @@ python main.py --video videos/跳远1-1.mp4
 | `--no-foul-detection` | - | 禁用犯规检测 |
 | `--diff` | - | 启用 MOG2 背景差分法距离修正（与 `--yolo` 互斥） |
 | `--yolo VERSION SCALE` | - | 启用 YOLO 实例分割距离修正（与 `--diff` 互斥），如 `--yolo 26 x`。YOLO 起跳点更靠近垫子边界（更保守）时自动覆盖骨骼修正值 |
-| `--enable-mat-output` | - | 输出垫子识别图 (mat_mask_quad/hsv) |
+| `--enable-mat-output` | - | 输出垫子识别图：`mat_mask_quad.jpeg` 为实心四边形 mask，`mat_mask_hsv.jpeg` 为四边形内可见颜色区域 |
 | `--test-grid` | - | 输出垫子毫米格测试图（起跳线外每 10cm 画一条绿线） |
 | `--debug` | - | 调试模式：每帧记录 IDLE/READY/JUMPING 各状态的全量判定参数到运行日志 |
 
@@ -160,7 +163,7 @@ tiaoyuan/
 
 ### Skeleton 骨骼关键点法
 
-1. **垫子标定**: HSV 颜色分割自动识别绿色垫子，通过轮廓拟合四边形并计算透视变换矩阵。支持画面顶部 40% 区域屏蔽以滤除天空/树木等绿色噪声，形态学操作使用 9x9 开运算 + 5x5 闭运算去除毛刺
+1. **垫子标定**: HSV 颜色分割自动识别绿色垫子，结合低饱和强光补全、水平长核闭运算、轮廓四边形拟合和 Hough/Canny 边缘线微调，计算透视变换矩阵。默认屏蔽画面顶部 50% 以滤除天空/树木等绿色噪声；`render_mask()` 输出实心垫子四边形，`render_visible_mask()` 输出四边形内可见颜色区域。针对 HDR 原视频比 SDR 截图更亮、饱和度更低的情况，检测到强光/HDR 且四边形透视比例异常时，会自动使用更严格的色相下界重检，避免垫子左上角外扩
 2. **人体检测**: 通过 MediaPipe PoseLandmarker Heavy 模型（优先加载，自动从 CDN 下载 `pose_landmarker_heavy.task`，本地安装于 `mediapipe-0.10.35/` 目录；失败时回退到 Legacy Pose）获取每帧 33 个骨骼关键点坐标。支持多人检测（最多 5 人）。关键点索引：脚踝(27,28)、脚后跟(29,30)、脚尖(31,32)
 3. **两阶段入垫检测**:
    - 阶段一：脚尖进入垫子范围（`in_mat()`，垫子内 `0 ≤ x ≤ mat_length`，`0 ≤ y ≤ mat_width`）→ 输出 "检测到人体在垫内" 日志（仅一次）
@@ -229,6 +232,17 @@ python main.py --yolo 8 m --video videos/跳远1-1.mp4 --no-display
 | 多人入界 | 垫子内同时检测到 ≥ 2 人 |
 | 出界 | 落地点 Y 超出垫子宽度 |
 | 撑杆辅助 | 手腕 Y 低于膝盖 Y |
+
+## 调试输出说明
+
+启用 `--enable-mat-output` 后会在本次结果目录的 `images/` 下保存：
+
+- `mat_mask_quad.jpeg`：最终用于坐标标定的实心四边形垫子 mask。
+- `mat_mask_hsv.jpeg`：HSV/强光颜色提案在最终四边形内的可见区域，用于排查反光、阴影和 HDR/SDR 色彩差异。
+
+启用 `--test-grid` 后会额外保存：
+
+- `test_grid.jpeg`：原图叠加垫子边框、起跳线和 10cm 间隔网格，建议强光/HDR 场景优先检查这张图。
 
 ## License
 

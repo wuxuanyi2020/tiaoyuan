@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-YOLO_MODEL_DIR = r"E:\1-8体测项目\tiaoyuan\yolo_model"
+YOLO_MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "yolo_model")
 
 # MediaPipe Pose 连接（33 点模型的核心连接）
 _MP_CONNECTIONS = [

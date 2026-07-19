@@ -305,7 +305,8 @@ class StandingLongJumpSystem:
     def _recalc_results_with_current_mat(self):
         if not self.calibrator.calibrated:
             return
-        if self.takeoff_x_cm is not None:
+        # 启用 YOLO/DIFF 时由修正后的起跳线统一判断踩线，此处跳过
+        if self.takeoff_x_cm is not None and not self.config.enable_seg and not self.config.enable_diff:
             self.foul_detector.check_line_violation(self.takeoff_x_cm, self.config.takeoff_line_cm)
         if self.final_distance_cm is not None and self.landing_x_cm is not None:
             ld_cm = (self.landing_x_cm, 0.0)
@@ -482,8 +483,10 @@ class StandingLongJumpSystem:
 
         self.foul_detector.check_step_jump(self._skeleton_front_toe_hist, self._skeleton_baseline_x_cm)
         self.foul_detector.check_single_leg_takeoff(takeoff_kpts)
-        self.foul_detector.check_line_violation(takeoff_x, self.config.takeoff_line_cm)
         self.foul_detector.check_prop_assistance(takeoff_kpts)
+        # 启用 YOLO/DIFF 时延后踩线检测（等修正后的起跳线）
+        if not self.config.enable_seg and not self.config.enable_diff:
+            self.foul_detector.check_line_violation(takeoff_x, self.config.takeoff_line_cm)
         if self.foul_detector.reason:
             self._log("FOUL", f"起跳时检测到犯规: {self.foul_detector.reason}")
 
@@ -888,10 +891,11 @@ class StandingLongJumpSystem:
                             mask_quad = self.calibrator.render_mask(frame)
                             if mask_quad is not None:
                                 imwrite_safe(os.path.join(self.images_dir, "mat_mask_quad.jpeg"), cv2.cvtColor(mask_quad, cv2.COLOR_GRAY2BGR))
-                            mask_hsv = self.calibrator.render_hsv_mask(frame)
+                            # 输出四边形内的可见颜色区域，和 D:/DeepLearning/hsv/run_calib_test.py 保持一致
+                            mask_hsv = self.calibrator.render_visible_mask(frame)
                             if mask_hsv is not None:
                                 imwrite_safe(os.path.join(self.images_dir, "mat_mask_hsv.jpeg"), cv2.cvtColor(mask_hsv, cv2.COLOR_GRAY2BGR))
-                            self._log("CALIB", "垫子识别图已保存: mat_mask_quad.jpeg (四边形拟合), mat_mask_hsv.jpeg (HSV原始)")
+                            self._log("CALIB", "垫子识别图已保存: mat_mask_quad.jpeg (实心四边形), mat_mask_hsv.jpeg (四边形内可见颜色区域)")
 
                         # 垫子毫米格测试图（默认不输出）
                         if self.config.enable_test_grid and self.images_dir:
@@ -1002,20 +1006,22 @@ class StandingLongJumpSystem:
                                       f"[{self.diff_detector.yolo_model_label}] "
                                       f"YOLO 实例分割总用时: {self.diff_detector.yolo_total_time:.3f}s")
 
-                        # YOLO 实例分割：始终以 YOLO 值为准
+                        # 保存原始骨骼修正值（仅用于图像标注）
+                        self._skeleton_takeoff_x_cm = self.takeoff_x_cm
+                        self._skeleton_landing_x_cm = self.landing_x_cm
+
+                        # 成绩以修正后的值为准（YOLO / DIFF）
+                        self.takeoff_x_cm = to_x
+                        self.landing_x_cm = ld_x
+                        self.final_distance_cm = max(0.0, ld_x - to_x)
+                        self._log(log_tag, f"采用{log_label}结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, 距离={self.final_distance_cm:.1f}cm")
+
+                        # 用修正后的起跳线重新判断踩线犯规
+                        self.foul_detector.check_line_violation(self.takeoff_x_cm, self.config.takeoff_line_cm)
+
                         if self.config.enable_seg:
                             self._yolo_takeoff_x_cm = to_x
                             self._yolo_landing_x_cm = ld_x
-
-                            # 保存原始骨骼修正值（仅用于图像标注）
-                            self._skeleton_takeoff_x_cm = self.takeoff_x_cm
-                            self._skeleton_landing_x_cm = self.landing_x_cm
-
-                            # 成绩以 YOLO 值为准
-                            self.takeoff_x_cm = to_x
-                            self.landing_x_cm = ld_x
-                            self.final_distance_cm = max(0.0, ld_x - to_x)
-                            self._log("YOLO", f"采用YOLO结果: 起跳={to_x:.1f}cm, 落地={ld_x:.1f}cm, 距离={self.final_distance_cm:.1f}cm")
 
                             # 重保存 takeoff/score 图像以绘制 YOLO 线
                             if self._takeoff_frame_img is not None:
@@ -1025,7 +1031,7 @@ class StandingLongJumpSystem:
                                     self._takeoff_kpts,
                                     self._takeoff_all_kpts_list,
                                 )
-                            # 落地图像由后面的 _save_landed_image(line 1035) 自然重新保存
+                            # 落地图像由后面的 _save_landed_image(line 1043) 自然重新保存
                             # 重新保存 score 和 payload
                             img_base = self._landing_frame_img if self._landing_frame_img is not None else frame
                             self._score_saved = False
