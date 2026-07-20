@@ -149,6 +149,12 @@ class DiffDetector:
         # ── 检测到的边缘像素点 ──
         self._takeoff_edge_px = None
         self._landing_edge_px = None
+        # 俯视图(Mat_Projection)里的最终极值像素点；用于让 Stage3 标记和投影 mask 完全一致
+        self._takeoff_edge_mat_px = None
+        self._landing_edge_mat_px = None
+        # 最终被选中的脚（left/right）；ROI 重叠时避免把同一个点画到另一只脚的 Stage3 行里
+        self._takeoff_edge_foot_label = None
+        self._landing_edge_foot_label = None
 
         # ── 结果(cm) ──
         self.takeoff_shoe_x_cm = None
@@ -218,17 +224,18 @@ class DiffDetector:
         else:
             half_w = half_h = min_half
 
+        # X 方向覆盖完整鞋长；Y 方向只取关键点上下约 3% 短边的窄带，
+        # 避免把小腿/大面积投影阴影纳入 MOG2 极值。
         x1 = max(0, int(cx - half_w))
-        y1 = max(0, int(cy - half_h * 0.0))  # 暴力下压，避开脚踝
         x2 = min(w_img, int(cx + half_w))
-        y2 = min(h_img, int(cy + half_h * 0.0))  # 上提底部，避开下方阴影
+        foot_y_half = max(ref * 0.03, 18.0)
+        y1 = max(0, int(cy - foot_y_half))
+        y2 = min(h_img, int(cy + foot_y_half))
 
-        # 分辨率自适应的边距（短边的 3%，替代固定 30px）
+        # X 方向分辨率自适应边距（短边 3%，替代固定 30px）；Y 已是贴地窄带，不再额外扩张。
         margin = int(ref * 0.03)
         x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
         x2 = min(w_img, x2 + margin)
-        y2 = min(h_img, y2 + margin)
 
         if shrink_inward > 0.0:
             box_w = x2 - x1
@@ -318,25 +325,74 @@ class DiffDetector:
         if base_roi.shape != roi_gray.shape:
             return None
 
+        # 强光/影子场景下 MOG2 的 127 shadow 像素很容易把鞋底影子也填进去，
+        # 所以这里不再“非零全保留”，而是：MOG2 前景(255) + 灰度差 + 边缘差 三者交叉约束。
+        base_blur = cv2.GaussianBlur(base_roi, (3, 3), 0)
+        curr_blur = cv2.GaussianBlur(roi_gray, (3, 3), 0)
+        diff = cv2.absdiff(base_blur, curr_blur)
+        diff_mean, diff_std = cv2.meanStdDev(diff)
+        diff_thr = float(diff_mean[0][0] + 1.2 * diff_std[0][0])
+        diff_thr = max(10.0, min(45.0, diff_thr))
+        _, diff_bin = cv2.threshold(diff, diff_thr, 255, cv2.THRESH_BINARY)
+
         bg_sub = cv2.createBackgroundSubtractorMOG2(
-            history=2, varThreshold=20, detectShadows=True)
-        bg_sub.apply(base_roi)          # 训练背景
-        fg_mask = bg_sub.apply(roi_gray)  # 提取前景
+            history=2, varThreshold=24, detectShadows=False)
+        bg_sub.apply(base_blur, learningRate=1.0)
+        fg_mask = bg_sub.apply(curr_blur, learningRate=0.0)
+        _, fg_bin = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
 
-        # ── 保留所有非零值（含阴影 127 和前景 255） ──
-        _, binary = cv2.threshold(fg_mask, 1, 255, cv2.THRESH_BINARY)
+        edge_base = self._edge_magnitude(base_blur)
+        edge_curr = self._edge_magnitude(curr_blur)
+        edge_delta = cv2.absdiff(edge_base, edge_curr)
+        _, edge_bin = cv2.threshold(edge_delta, 18, 255, cv2.THRESH_BINARY)
 
-        # ── 形态学去噪 ──
+        # 既要求明显灰度变化，又要求 MOG2 或边缘变化支持；像素太少时回退到灰度差，避免漏检黑鞋。
+        binary = cv2.bitwise_and(diff_bin, cv2.bitwise_or(fg_bin, edge_bin))
+        if cv2.countNonZero(binary) < 20:
+            binary = diff_bin
+
+        # 只保留投影后仍在垫子附近的像素，避免 ROI 边缘/背景物体被当作鞋边缘。
+        if self._calib.H_img2mat is not None:
+            yy, xx = np.indices((h_roi, w_roi))
+            pts = np.stack([xx.ravel() + x1, yy.ravel() + y1], axis=1).astype(np.float32)
+            mat_pts = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), self._calib.H_img2mat).reshape(-1, 2)
+            valid = ((mat_pts[:, 0] >= -15.0) & (mat_pts[:, 0] <= self._calib.mat_length_cm + 15.0)
+                     & (mat_pts[:, 1] >= -15.0) & (mat_pts[:, 1] <= self._calib.mat_width_cm + 15.0))
+            valid_mask = valid.reshape(h_roi, w_roi).astype(np.uint8) * 255
+            binary = cv2.bitwise_and(binary, valid_mask)
+
+        # ── 形态学去噪/补洞 ──
         kernel = np.ones((3, 3), np.uint8)
         clean = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # ── 外轮廓查找 + 实心填充 ──
+        # ── 外轮廓查找 + 实心填充：轮廓需靠近该脚关键点，防止选到远处影子/垫子噪点 ──
+        anchor_pts = []
+        for idx in foot_indices:
+            p = self._get_kpt(kpts, idx)
+            if p is not None:
+                anchor_pts.append((p[0] - x1, p[1] - y1))
+        anchor = np.mean(np.array(anchor_pts, dtype=np.float32), axis=0) if anchor_pts else None
+
         solid_mask = np.zeros_like(clean)
         contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = max(45.0, float(h_roi * w_roi) * 0.006)
+        max_anchor_dist = max(24.0, min(h_roi, w_roi) * 0.85)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > 150:  # 过滤小噪点
-                cv2.drawContours(solid_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            if area < min_area:
+                continue
+            if anchor is not None:
+                x, y, w, h = cv2.boundingRect(cnt)
+                cx = x + 0.5 * w
+                cy = y + 0.5 * h
+                if np.linalg.norm(np.array([cx, cy], dtype=np.float32) - anchor) > max_anchor_dist:
+                    continue
+            cv2.drawContours(solid_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+
+        # 与 YOLO mask 的“只保留贴近地面的鞋底部分”一致，MOG2 差分 ROI
+        # 也切掉上方 20%，减少小腿/裤脚晃动、强光影子被当成鞋边缘。
+        solid_mask[0:int(h_roi * 0.2), :] = 0
 
         return solid_mask, (x1, y1)
 
@@ -375,44 +431,119 @@ class DiffDetector:
                 continue
 
             binary, (x1, y1) = result
-            ys, xs = np.where(binary > 0)
+
+            # binary 是填充后的 SolidMask。用于可视化/投影保留填充 mask，
+            # 但 toe/heel 修正点必须从白色区域的边界像素里选，避免点落在白色内部。
+            edge_kernel = np.ones((3, 3), np.uint8)
+            eroded = cv2.erode(binary, edge_kernel, iterations=1)
+            boundary_mask = cv2.bitwise_and(binary, cv2.bitwise_not(eroded))
+            ys, xs = np.where(boundary_mask > 0)
+            if len(xs) < 15:
+                ys, xs = np.where(binary > 0)
             if len(xs) < 15:
                 continue
 
-            # 将 Mask 内所有像素转换到垫子坐标系，在物理空间取极值（避免透视畸变导致像素极值 ≠ 物理极值）
+            # 将 Mask 边界像素转换到垫子坐标系，在物理空间取极值（避免透视畸变导致像素极值 ≠ 物理极值）
             global_pts = np.stack([xs + x1, ys + y1], axis=1).astype(np.float32)  # (N, 2)
             mat_pts = cv2.perspectiveTransform(
                 global_pts.reshape(-1, 1, 2), self._calib.H_img2mat
             ).reshape(-1, 2)  # (N, 2)
             mat_xs = mat_pts[:, 0]
+            mat_ys = mat_pts[:, 1]
 
+            # 物理空间门控：MOG2 容易把脚尖/脚跟前后的影子当成极值。
+            # 先限制到垫子附近，再限制到 MediaPipe 脚关键点附近的合理鞋长范围。
+            valid = ((mat_xs >= -10.0) & (mat_xs <= self._calib.mat_length_cm + 10.0)
+                     & (mat_ys >= -12.0) & (mat_ys <= self._calib.mat_width_cm + 12.0))
+
+            anchor_xs = []
+            for idx_kpt in cfg["indices"]:
+                p = self._get_kpt(kpts, idx_kpt)
+                cm = self._calib.transform_to_mat_cm(p) if p is not None else None
+                if cm is not None:
+                    anchor_xs.append(float(cm[0]))
+            anchor_x = float(np.mean(anchor_xs)) if anchor_xs else None
+            if anchor_x is not None:
+                if edge_side == "toe":
+                    tight = valid & (mat_xs >= anchor_x - 22.0) & (mat_xs <= anchor_x + 13.0)
+                    loose = valid & (mat_xs >= anchor_x - 30.0) & (mat_xs <= anchor_x + 20.0)
+                else:
+                    tight = valid & (mat_xs >= anchor_x - 13.0) & (mat_xs <= anchor_x + 24.0)
+                    loose = valid & (mat_xs >= anchor_x - 20.0) & (mat_xs <= anchor_x + 32.0)
+                if np.count_nonzero(tight) >= 10:
+                    valid = tight
+                elif np.count_nonzero(loose) >= 10:
+                    valid = loose
+
+            if np.count_nonzero(valid) < 10:
+                continue
+
+            candidate_idx = np.where(valid)[0]
+
+            # toe/heel 必须来自 SolidMask 的黑白边界；先得到原图边界候选点。
             if edge_side == "toe":
-                idx = np.argmax(mat_xs)
+                idx = candidate_idx[np.argmax(mat_xs[candidate_idx])]
             else:
-                idx = np.argmin(mat_xs)
+                idx = candidate_idx[np.argmin(mat_xs[candidate_idx])]
 
             edge_px = (float(xs[idx] + x1), float(ys[idx] + y1))
             edge_cm_x = float(mat_xs[idx])
+            edge_mat_px = None
 
-            if edge_cm_x < -10 or edge_cm_x > 360:
-                continue
+            # 为了和 Stage3 的 Mat_Projection 视图严格一致，最终 X 优先直接从
+            # “投影后的 SolidMask”里取最右/最左白色边界像素。这样用户在俯视图
+            # 上看到的黄点，就是该行绿色/白色投影 mask 的极值点。
+            H_px = self._calib.get_H_img2mat_px()
+            scale = float(getattr(self._calib, "mat_view_scale", 1.0) or 1.0)
+            if H_px is not None and scale > 0:
+                h_img, w_img = frame_bgr.shape[:2]
+                mv_w = int(round(self._calib.mat_length_cm * scale))
+                mv_h = int(round(self._calib.mat_width_cm * scale))
+                if mv_w > 0 and mv_h > 0:
+                    full_one = np.zeros((h_img, w_img), dtype=np.uint8)
+                    full_one[y1:y1 + binary.shape[0], x1:x1 + binary.shape[1]] = binary
+                    mat_proj = cv2.warpPerspective(
+                        full_one, H_px, (mv_w, mv_h), flags=cv2.INTER_NEAREST
+                    )
+                    mat_proj = ((mat_proj > 0).astype(np.uint8)) * 255
+                    mat_eroded = cv2.erode(mat_proj, np.ones((3, 3), np.uint8), iterations=1)
+                    mat_boundary = cv2.bitwise_and(mat_proj, cv2.bitwise_not(mat_eroded))
+                    my, mx = np.where(mat_boundary > 0)
+                    if len(mx) > 0:
+                        if edge_side == "toe":
+                            ex = int(mx.max())
+                        else:
+                            ex = int(mx.min())
+                        ys_at_x = my[mx == ex]
+                        ey = int(np.median(ys_at_x)) if len(ys_at_x) else int(my[np.argmax(mx) if edge_side == "toe" else np.argmin(mx)])
+                        edge_cm_x = float(ex) / scale
+                        edge_mat_px = (float(ex), float(ey))
+
+                        # 原图 SolidMask 上仍需画一个对应点：选择投影位置最接近该极值像素的原图边界点。
+                        mat_px_pts = cv2.perspectiveTransform(
+                            global_pts.reshape(-1, 1, 2), H_px
+                        ).reshape(-1, 2)
+                        dist2 = (mat_px_pts[:, 0] - float(ex)) ** 2 + (mat_px_pts[:, 1] - float(ey)) ** 2
+                        nearest = int(np.argmin(dist2))
+                        edge_px = (float(global_pts[nearest, 0]), float(global_pts[nearest, 1]))
 
             per_foot.append({
                 "label": cfg["label"],
                 "binary": binary,
                 "origin": (x1, y1),
                 "edge_px": edge_px,
+                "edge_mat_px": edge_mat_px,
                 "edge_cm": edge_cm_x,
             })
-            all_px_cm.append((edge_cm_x, edge_px))
+            all_px_cm.append((edge_cm_x, edge_px, edge_mat_px, cfg["label"]))
 
         if not all_px_cm:
             return None
 
         if edge_side == "toe":
-            best_cm, best_px = max(all_px_cm, key=lambda x: x[0])
+            best_cm, best_px, best_mat_px, best_foot_label = max(all_px_cm, key=lambda x: x[0])
         else:
-            best_cm, best_px = min(all_px_cm, key=lambda x: x[0])
+            best_cm, best_px, best_mat_px, best_foot_label = min(all_px_cm, key=lambda x: x[0])
 
         # 构建全帧差分 Mask
         full_mask = np.zeros(frame_bgr.shape[:2], dtype=np.uint8)
@@ -426,9 +557,13 @@ class DiffDetector:
         if edge_side == "toe":
             self.takeoff_diff_mask = full_mask
             self._takeoff_edge_px = best_px
+            self._takeoff_edge_mat_px = best_mat_px
+            self._takeoff_edge_foot_label = best_foot_label
         else:
             self.landing_diff_mask = full_mask
             self._landing_edge_px = best_px
+            self._landing_edge_mat_px = best_mat_px
+            self._landing_edge_foot_label = best_foot_label
 
         return best_cm
 
@@ -603,7 +738,7 @@ class DiffDetector:
                     _full_m = np.zeros((h_img, w_img), dtype=np.uint8)
                     _full_m[y1:y1 + h_roi, x1:x1 + w_roi] = final_mask
                     # 透视变换到垫子俯视图
-                    _mat_proj = cv2.warpPerspective(_full_m, _H_px, (_mv_w, _mv_h))
+                    _mat_proj = cv2.warpPerspective(_full_m, _H_px, (_mv_w, _mv_h), flags=cv2.INTER_NEAREST)
                     # 绘制垫子俯视图
                     _col_mat = np.full((_mv_h, _mv_w, 3), 36, dtype=np.uint8)
                     _col_mat[_mat_proj > 0] = (0, 200, 0)
@@ -666,12 +801,28 @@ class DiffDetector:
             if base_roi.shape != roi_current.shape:
                 continue
 
-            # MOG2 提取
+            # 与 _foot_diff_mask 保持一致的调试中间图：
+            # 1) 灰度差分过滤亮度变化；2) MOG2 只保留 255 前景，不吃 127 阴影；3) 边缘差辅助鞋轮廓。
+            base_blur = cv2.GaussianBlur(base_roi, (3, 3), 0)
+            curr_blur = cv2.GaussianBlur(roi_current, (3, 3), 0)
+            diff = cv2.absdiff(base_blur, curr_blur)
+            diff_mean, diff_std = cv2.meanStdDev(diff)
+            diff_thr = float(diff_mean[0][0] + 1.2 * diff_std[0][0])
+            diff_thr = max(10.0, min(45.0, diff_thr))
+            _, diff_bin = cv2.threshold(diff, diff_thr, 255, cv2.THRESH_BINARY)
+
             bg_sub = cv2.createBackgroundSubtractorMOG2(
-                history=2, varThreshold=20, detectShadows=True)
-            bg_sub.apply(base_roi)
-            fg_mask = bg_sub.apply(roi_current)
-            fg_vis = cv2.normalize(fg_mask, None, 0, 255, cv2.NORM_MINMAX)
+                history=2, varThreshold=24, detectShadows=False)
+            bg_sub.apply(base_blur, learningRate=1.0)
+            fg_mask = bg_sub.apply(curr_blur, learningRate=0.0)
+            _, fg_bin = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+
+            edge_base = self._edge_magnitude(base_blur)
+            edge_curr = self._edge_magnitude(curr_blur)
+            edge_delta = cv2.absdiff(edge_base, edge_curr)
+            _, edge_bin = cv2.threshold(edge_delta, 18, 255, cv2.THRESH_BINARY)
+            support_vis = cv2.bitwise_or(fg_bin, edge_bin)
+            combined_vis = cv2.bitwise_and(diff_bin, support_vis)
 
             mask_result = self._foot_diff_mask(
                 frame, kpts, cfg["indices"],
@@ -687,17 +838,72 @@ class DiffDetector:
 
             col_raw_base = cv2.cvtColor(_r(base_roi), cv2.COLOR_GRAY2BGR)
             col_raw_curr = cv2.cvtColor(_r(roi_current), cv2.COLOR_GRAY2BGR)
-            col_fg = cv2.cvtColor(_r(fg_vis), cv2.COLOR_GRAY2BGR)
+            col_diff = cv2.cvtColor(_r(diff_bin), cv2.COLOR_GRAY2BGR)
+            col_support = cv2.cvtColor(_r(support_vis), cv2.COLOR_GRAY2BGR)
+            col_combined = cv2.cvtColor(_r(combined_vis), cv2.COLOR_GRAY2BGR)
             col_binary = cv2.cvtColor(_r(binary), cv2.COLOR_GRAY2BGR)
 
+            # 在最终 SolidMask 上标记本次用于修正的 toe/heel 边缘点。
+            _edge_px = self._takeoff_edge_px if which == "takeoff" else self._landing_edge_px
+            _edge_label = "toe" if which == "takeoff" else "heel"
+            _edge_foot_label = self._takeoff_edge_foot_label if which == "takeoff" else self._landing_edge_foot_label
+            _edge_in_this_roi = (
+                _edge_px is not None
+                and (_edge_foot_label is None or cfg["label"] == _edge_foot_label)
+                and x1 <= _edge_px[0] < x1 + w
+                and y1 <= _edge_px[1] < y1 + h
+            )
+            if _edge_in_this_roi:
+                _scale = target_h / h
+                lx = int(round((_edge_px[0] - x1) * _scale))
+                ly = int(round((_edge_px[1] - y1) * _scale))
+                lx = max(0, min(col_binary.shape[1] - 1, lx))
+                ly = max(0, min(col_binary.shape[0] - 1, ly))
+                cv2.circle(col_binary, (lx, ly), 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+                cv2.putText(col_binary, _edge_label, (lx + 8, max(12, ly - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, lineType=cv2.LINE_AA)
+
+            # 将 MOG2 最终 mask 投影到垫子俯视图，方便检查物理坐标上的边缘选择。
+            _H_px = self._calib.get_H_img2mat_px()
+            if _H_px is not None:
+                _mv_w = int(round(self._calib.mat_length_cm * self._calib.mat_view_scale))
+                _mv_h = int(round(self._calib.mat_width_cm * self._calib.mat_view_scale))
+                _full_m = np.zeros((h_img, w_img), dtype=np.uint8)
+                _full_m[y1:y1 + h, x1:x1 + w] = binary
+                _mat_proj = cv2.warpPerspective(_full_m, _H_px, (_mv_w, _mv_h), flags=cv2.INTER_NEAREST)
+                _col_mat = np.full((_mv_h, _mv_w, 3), 36, dtype=np.uint8)
+                _col_mat[_mat_proj > 0] = (0, 200, 0)
+                # 只在“包含该 toe/heel 点的那只脚”的投影图上画点；
+                # 另一只脚的投影只显示自己的 mask，避免出现点不在本行最右/最左白区的错觉。
+                if _edge_in_this_roi:
+                    _edge_mat_px = self._takeoff_edge_mat_px if which == "takeoff" else self._landing_edge_mat_px
+                    if _edge_mat_px is not None:
+                        lx_mat = int(round(_edge_mat_px[0]))
+                        ly_mat = int(round(_edge_mat_px[1]))
+                    else:
+                        pt_img = np.array([[[_edge_px[0], _edge_px[1]]]], dtype=np.float32)
+                        pt_mat = cv2.perspectiveTransform(pt_img, _H_px).reshape(-1, 2)[0]
+                        lx_mat = int(round(pt_mat[0]))
+                        ly_mat = int(round(pt_mat[1]))
+                    if 0 <= lx_mat < _mv_w and 0 <= ly_mat < _mv_h:
+                        cv2.circle(_col_mat, (lx_mat, ly_mat), 5, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+                        cv2.putText(_col_mat, _edge_label, (lx_mat + 8, max(12, ly_mat - 5)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, lineType=cv2.LINE_AA)
+                col_mat_r = _r(_col_mat)
+            else:
+                col_mat_r = np.zeros((target_h, 60, 3), dtype=np.uint8)
+
             tag_h = 28
+            imgs_tagged = []
             for cimg, t in [(col_raw_base, "RawBase"), (col_raw_curr, "RawCurrent"),
-                            (col_fg, "MOG2_FG"), (col_binary, "SolidMask")]:
+                            (col_diff, "GrayDiff"), (col_support, "MOG2|Edge"),
+                            (col_combined, "PreClean"), (col_binary, "SolidMask"),
+                            (col_mat_r, "Mat_Projection")]:
                 tb = np.zeros((tag_h, cimg.shape[1], 3), dtype=np.uint8)
                 cv2.putText(tb, t, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cimg[:] = np.vstack([tb, cimg])[:cimg.shape[0]]
+                imgs_tagged.append(np.vstack([tb, cimg]))
 
-            strip = cv2.hconcat([col_raw_base, col_raw_curr, col_fg, col_binary])
+            strip = cv2.hconcat(imgs_tagged)
             cv2.putText(strip, cfg["label"], (8, tag_h + 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 255, 0) if is_left else (0, 255, 255), 2)
@@ -712,7 +918,7 @@ class DiffDetector:
         canvas[title_h:, :collage.shape[1]] = collage
         canvas = self._put_text_cn(
             canvas,
-            f"Stage3 - MOG2 ({label}): 原始图(左 vs 右) → MOG2 前景 → 实心填充Mask",
+            f"Stage3 - MOG2 ({label}): Raw → GrayDiff → MOG2/Edge支持 → PreClean → SolidMask → Mat_Projection(俯视)",
             (20, 6), (255, 255, 255), size=22)
         return canvas
 
