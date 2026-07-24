@@ -45,3 +45,8 @@ backup/
 
 # 基准测试脚本
 benchmark_yolo.py
+
+# Codex/local debug scratch
+_*.py
+_ocr_crop_*.png
+Code_Generated_Image.png

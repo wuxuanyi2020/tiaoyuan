@@ -117,11 +117,12 @@ class DiffDetector:
         draw.text(pos, text, font=font, fill=color[::-1])
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-    def __init__(self, calibrator, enable_seg=False, yolo_version="11", yolo_scale="x"):
+    def __init__(self, calibrator, enable_seg=False, yolo_version="11", yolo_scale="x", jump_direction="ltr"):
         self._calib = calibrator
         self.enable_seg = enable_seg
         self.yolo_version = yolo_version
         self.yolo_scale = yolo_scale
+        self.set_jump_direction(jump_direction)
 
         # ── 基准帧 ──
         self._base_frame_raw = None
@@ -159,6 +160,26 @@ class DiffDetector:
         # ── 结果(cm) ──
         self.takeoff_shoe_x_cm = None
         self.landing_shoe_x_cm = None
+
+    @staticmethod
+    def _normalize_jump_direction(jump_direction):
+        v = str(jump_direction or "ltr").strip().lower()
+        if v in ("rtl", "right-to-left", "right2left", "r2l"):
+            return "rtl"
+        return "ltr"
+
+    def set_jump_direction(self, jump_direction):
+        self.jump_direction = self._normalize_jump_direction(jump_direction)
+        self.is_rtl = (self.jump_direction == "rtl")
+
+    def _forward_distance(self, takeoff_x, landing_x):
+        if takeoff_x is None or landing_x is None:
+            return 0.0
+        return max(0.0, (takeoff_x - landing_x) if self.is_rtl else (landing_x - takeoff_x))
+
+    def _edge_takes_max_x(self, edge_side):
+        # toe 是跳跃前进方向最前端；heel 是离起跳线最近的后缘。
+        return (edge_side == "toe" and not self.is_rtl) or (edge_side == "heel" and self.is_rtl)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 基准帧
@@ -410,7 +431,7 @@ class DiffDetector:
         Args:
             frame_bgr: 当前帧彩色 BGR 图像
             kpts:      当前帧关键点
-            edge_side: "toe"（脚尖, X 最大）或 "heel"（脚后跟, X 最小）
+            edge_side: "toe"（脚尖前缘）或 "heel"（脚后跟后缘），会按 jump_direction 自动取 X 极值
 
         返回:
             x_cm: 鞋子边缘在垫子坐标系下的 X 值(cm)
@@ -465,11 +486,19 @@ class DiffDetector:
             anchor_x = float(np.mean(anchor_xs)) if anchor_xs else None
             if anchor_x is not None:
                 if edge_side == "toe":
-                    tight = valid & (mat_xs >= anchor_x - 22.0) & (mat_xs <= anchor_x + 13.0)
-                    loose = valid & (mat_xs >= anchor_x - 30.0) & (mat_xs <= anchor_x + 20.0)
+                    if self.is_rtl:
+                        tight = valid & (mat_xs >= anchor_x - 13.0) & (mat_xs <= anchor_x + 22.0)
+                        loose = valid & (mat_xs >= anchor_x - 20.0) & (mat_xs <= anchor_x + 30.0)
+                    else:
+                        tight = valid & (mat_xs >= anchor_x - 22.0) & (mat_xs <= anchor_x + 13.0)
+                        loose = valid & (mat_xs >= anchor_x - 30.0) & (mat_xs <= anchor_x + 20.0)
                 else:
-                    tight = valid & (mat_xs >= anchor_x - 13.0) & (mat_xs <= anchor_x + 24.0)
-                    loose = valid & (mat_xs >= anchor_x - 20.0) & (mat_xs <= anchor_x + 32.0)
+                    if self.is_rtl:
+                        tight = valid & (mat_xs >= anchor_x - 24.0) & (mat_xs <= anchor_x + 13.0)
+                        loose = valid & (mat_xs >= anchor_x - 32.0) & (mat_xs <= anchor_x + 20.0)
+                    else:
+                        tight = valid & (mat_xs >= anchor_x - 13.0) & (mat_xs <= anchor_x + 24.0)
+                        loose = valid & (mat_xs >= anchor_x - 20.0) & (mat_xs <= anchor_x + 32.0)
                 if np.count_nonzero(tight) >= 10:
                     valid = tight
                 elif np.count_nonzero(loose) >= 10:
@@ -481,7 +510,7 @@ class DiffDetector:
             candidate_idx = np.where(valid)[0]
 
             # toe/heel 必须来自 SolidMask 的黑白边界；先得到原图边界候选点。
-            if edge_side == "toe":
+            if self._edge_takes_max_x(edge_side):
                 idx = candidate_idx[np.argmax(mat_xs[candidate_idx])]
             else:
                 idx = candidate_idx[np.argmin(mat_xs[candidate_idx])]
@@ -510,12 +539,13 @@ class DiffDetector:
                     mat_boundary = cv2.bitwise_and(mat_proj, cv2.bitwise_not(mat_eroded))
                     my, mx = np.where(mat_boundary > 0)
                     if len(mx) > 0:
-                        if edge_side == "toe":
+                        take_max_x = self._edge_takes_max_x(edge_side)
+                        if take_max_x:
                             ex = int(mx.max())
                         else:
                             ex = int(mx.min())
                         ys_at_x = my[mx == ex]
-                        ey = int(np.median(ys_at_x)) if len(ys_at_x) else int(my[np.argmax(mx) if edge_side == "toe" else np.argmin(mx)])
+                        ey = int(np.median(ys_at_x)) if len(ys_at_x) else int(my[np.argmax(mx) if take_max_x else np.argmin(mx)])
                         edge_cm_x = float(ex) / scale
                         edge_mat_px = (float(ex), float(ey))
 
@@ -540,7 +570,7 @@ class DiffDetector:
         if not all_px_cm:
             return None
 
-        if edge_side == "toe":
+        if self._edge_takes_max_x(edge_side):
             best_cm, best_px, best_mat_px, best_foot_label = max(all_px_cm, key=lambda x: x[0])
         else:
             best_cm, best_px, best_mat_px, best_foot_label = min(all_px_cm, key=lambda x: x[0])
@@ -614,7 +644,7 @@ class DiffDetector:
         ld_x = self.compute_landing()
         if to_x is None or ld_x is None:
             return None, None, None
-        dist = max(0.0, ld_x - to_x)
+        dist = self._forward_distance(to_x, ld_x)
         return to_x, ld_x, dist
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1042,7 +1072,7 @@ class DiffDetector:
                         (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             y_offset += 30
         if mode == "combined" and self.takeoff_shoe_x_cm is not None and self.landing_shoe_x_cm is not None:
-            dist = max(0.0, self.landing_shoe_x_cm - self.takeoff_shoe_x_cm)
+            dist = self._forward_distance(self.takeoff_shoe_x_cm, self.landing_shoe_x_cm)
             cv2.putText(vis, f"Diff Distance: {dist:.1f} cm",
                         (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 

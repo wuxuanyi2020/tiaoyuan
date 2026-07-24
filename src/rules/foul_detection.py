@@ -14,11 +14,12 @@ class FoulDetector:
     def reset(self):
         self.reason = None
 
-    def check_step_jump(self, front_toe_hist, takeoff_toe_x_cm):
+    def check_step_jump(self, front_toe_hist, takeoff_toe_x_cm, jump_direction="ltr"):
         if not self.enabled or not front_toe_hist or takeoff_toe_x_cm is None:
             return
         initial_x = front_toe_hist[0][0]
-        diff = takeoff_toe_x_cm - initial_x
+        is_rtl = str(jump_direction).lower() in ("rtl", "right-to-left", "right2left")
+        diff = (initial_x - takeoff_toe_x_cm) if is_rtl else (takeoff_toe_x_cm - initial_x)
         if diff > 10.0:
             self._set_reason("垫步 (Step Jump)", f"检测到犯规动作: 垫步 (Step Jump), diff={diff:.1f}cm")
 
@@ -78,10 +79,12 @@ class FoulDetector:
         if y_cm < 0.0 or y_cm > self.calibrator.mat_width_cm:
             self._set_reason("出界 (Out of Bounds)", "检测到犯规动作: 出界 (Out of Bounds)")
 
-    def check_line_violation(self, current_toe_x_cm, takeoff_line_cm):
+    def check_line_violation(self, current_toe_x_cm, takeoff_line_cm, jump_direction="ltr"):
         if not self.enabled or current_toe_x_cm is None:
             return
-        if current_toe_x_cm > (takeoff_line_cm + 1.0):
+        # ltr：起跳线在左侧，脚尖越过线向右为踩线；rtl：起跳线在右侧，脚尖越过线向左为踩线。
+        is_rtl = str(jump_direction).lower() in ("rtl", "right-to-left", "right2left")
+        if (not is_rtl and current_toe_x_cm > (takeoff_line_cm + 1.0)) or (is_rtl and current_toe_x_cm < (takeoff_line_cm - 1.0)):
             self._set_reason("踩线 (Line Violation)", "检测到犯规动作: 踩线 (Line Violation)")
 
     def _set_reason(self, reason, message):

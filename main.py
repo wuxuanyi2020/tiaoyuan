@@ -26,14 +26,23 @@ def build_parser():
     parser.add_argument("--no-display", action="store_true", help="不显示预览窗口（批量模式默认启用）")
     parser.add_argument("--backend", type=str, default="mediapipe")
     parser.add_argument("--debug-dir", type=str, default=None)
-    parser.add_argument("--record", type=str, default=None, help="录制输出视频路径")
+    parser.add_argument("--record", type=str, default=None, help="录制输出视频路径（旧参数，需要手动给路径）")
+    parser.add_argument("--output-video", nargs="?", const="auto", default=None, metavar="PATH",
+                        help="输出运行时程序画面视频；不写 PATH 时自动保存到本次结果目录 run_view.mp4")
     parser.add_argument("--mat-length-cm", type=float, default=338.0)
     parser.add_argument("--mat-width-cm", type=float, default=100.0)
     parser.add_argument("--trigger-move-cm", type=float, default=32.0)
     parser.add_argument("--trigger-frames", type=int, default=2)
-    parser.add_argument("--min-flight-frames", type=int, default=5)
-    parser.add_argument("--max-jump-frames", type=int, default=120)
-    parser.add_argument("--takeoff-line-cm", type=float, default=31.0)
+    parser.add_argument("--takeoff-backtrack-frames", type=int, default=2,
+                        help="起跳触发帧倒推多少帧作为正式起跳帧，默认2帧")
+    parser.add_argument("--min-flight-frames", type=int, default=10,
+                        help="起跳触发帧到最早有效落地帧的最小间隔，默认10帧，避免半空误判落地")
+    parser.add_argument("--max-jump-frames", type=int, default=30,
+                        help="起跳后最长等待落地帧数，默认30帧(30fps约1秒)，超时仍无可靠触地则不给成绩")
+    parser.add_argument("--takeoff-line-cm", type=float, default=31.0,
+                        help="起跳线距起跳端的距离(cm)，默认31；--jump-direction rtl 时会自动换算到垫子右侧")
+    parser.add_argument("--jump-direction", choices=["ltr", "rtl"], default="ltr",
+                        help="跳跃方向：ltr=画面左到右(默认)，rtl=画面右到左/起跳线在右侧")
     parser.add_argument("--takeoff-offset-cm", type=float, default=3.0)
     parser.add_argument("--manual-calib", action="store_true", help="手动四点标定（需鼠标点击）")
     parser.add_argument("--no-foul-detection", action="store_true", help="禁用犯规检测（默认开启）")
@@ -45,11 +54,38 @@ def build_parser():
                         help="启用 YOLO 实例分割距离修正，指定版本和尺度，如 --yolo 26 x（版本: 8/11/26, 尺度: n/s/m/l/x）")
     parser.add_argument("--enable-mat-output", action="store_true", help="输出垫子识别图 (mat_mask_quad/hsv)")
     parser.add_argument("--test-grid", action="store_true", help="输出垫子毫米格测试图")
+    parser.add_argument("--stream-mode", action="store_true", help="模拟流模式：完成一跳后不中断，垫内无人时重新标定并继续输出多跳成绩")
+    parser.add_argument("--stream-recalib-empty-frames", type=int, default=15, help="流模式下垫内无人连续多少帧后重新标定并锁定，默认15帧")
+    parser.add_argument("--ocr-time", action="store_true", help="识别左上角模拟时间码，并在结果中输出到帧的 timecode")
+    parser.add_argument("--ocr-roi", nargs=4, type=int, metavar=("X", "Y", "W", "H"), default=(15, 18, 155, 30), help="左上角时间 OCR 区域，默认 15 18 155 30")
     # 批量模式
     parser.add_argument("--batch", action="store_true", help="批量处理 videos/ 下所有视频（跳远1-1 ~ 跳远1-9）")
     parser.add_argument("--videos", nargs="*", default=None, help="批量处理指定的视频列表")
     return parser
 
+
+
+def resolve_record_path(args, result_dir, video_name):
+    """解析运行画面录制路径。
+
+    --record 保持兼容：用户必须给完整路径；
+    --output-video 是新参数：单独使用时自动写到本次结果目录。
+    """
+    if getattr(args, "record", None):
+        return str(args.record).strip().strip('"').strip("'")
+    output_video = getattr(args, "output_video", None)
+    if output_video is None:
+        return None
+    if output_video == "auto":
+        return os.path.join(result_dir, "run_view.mp4")
+    path = str(output_video).strip().strip('"').strip("'")
+    if not path:
+        return os.path.join(result_dir, "run_view.mp4")
+    root, ext = os.path.splitext(path)
+    if os.path.isdir(path) or not ext:
+        os.makedirs(path, exist_ok=True)
+        return os.path.join(path, f"{video_name}_run_view.mp4")
+    return path
 
 def run_single(video_path, args):
     """运行单个视频处理。"""
@@ -68,14 +104,16 @@ def run_single(video_path, args):
             display=False,
             backend=args.backend,
             debug_dir=args.debug_dir,
-            record_path=args.record,
+            record_path=resolve_record_path(args, result_dir, video_name),
             mat_length_cm=args.mat_length_cm,
             mat_width_cm=args.mat_width_cm,
             trigger_move_cm=args.trigger_move_cm,
             trigger_frames=args.trigger_frames,
+            takeoff_backtrack_frames=args.takeoff_backtrack_frames,
             min_flight_frames=args.min_flight_frames,
             max_jump_frames=args.max_jump_frames,
             takeoff_line_cm=args.takeoff_line_cm,
+            jump_direction=args.jump_direction,
             takeoff_offset_cm=args.takeoff_offset_cm,
             manual_calib=args.manual_calib,
             result_dir=result_dir,
@@ -88,6 +126,10 @@ def run_single(video_path, args):
         yolo_version=args.yolo[0] if args.yolo else "11",
         yolo_scale=args.yolo[1] if args.yolo else "x",
         debug=args.debug,
+        stream_mode=args.stream_mode,
+        stream_recalib_empty_frames=args.stream_recalib_empty_frames,
+        enable_ocr_time=args.ocr_time,
+        ocr_roi=tuple(args.ocr_roi),
     )
     StandingLongJumpSystem(config).run()
 
@@ -190,14 +232,16 @@ def main():
         save_path=os.path.join(result_dir, "result.json"),
         backend=args.backend,
         debug_dir=args.debug_dir,
-        record_path=args.record,
+        record_path=resolve_record_path(args, result_dir, video_name),
         mat_length_cm=args.mat_length_cm,
         mat_width_cm=args.mat_width_cm,
         trigger_move_cm=args.trigger_move_cm,
         trigger_frames=args.trigger_frames,
+        takeoff_backtrack_frames=args.takeoff_backtrack_frames,
         min_flight_frames=args.min_flight_frames,
         max_jump_frames=args.max_jump_frames,
         takeoff_line_cm=args.takeoff_line_cm,
+        jump_direction=args.jump_direction,
         takeoff_offset_cm=args.takeoff_offset_cm,
         manual_calib=args.manual_calib,
         result_dir=result_dir,
@@ -210,6 +254,10 @@ def main():
         yolo_version=args.yolo[0] if args.yolo else "11",
         yolo_scale=args.yolo[1] if args.yolo else "x",
         debug=args.debug,
+        stream_mode=args.stream_mode,
+        stream_recalib_empty_frames=args.stream_recalib_empty_frames,
+        enable_ocr_time=args.ocr_time,
+        ocr_roi=tuple(args.ocr_roi),
     )
     StandingLongJumpSystem(config).run()
 

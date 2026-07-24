@@ -20,6 +20,14 @@ class PoseEstimator:
         self.cap = None
         self.person_count = 0
         self.all_kpts_list = []
+        # 保守提高关键点置信度阈值：之前 foot=0.30 容易在强光/逆光
+        # 或右向左视频中接受单帧脚尖漂移；这里回收一点阈值，宁可
+        # 短暂丢几帧脚点，也不要把明显乱飞的脚尖当作起跳触发。
+        self._foot_landmark_ids = {27, 28, 29, 30, 31, 32}
+        self._body_visibility_threshold = 0.50
+        self._foot_visibility_threshold = 0.30
+        self._last_pose_center = None
+
 
         try:
             import mediapipe as mp
@@ -33,9 +41,9 @@ class PoseEstimator:
                 base_options=base_options,
                 running_mode=mp.tasks.vision.RunningMode.VIDEO,
                 num_poses=5,
-                min_pose_detection_confidence=0.5,
-                min_pose_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_pose_detection_confidence=0.45,
+                min_pose_presence_confidence=0.45,
+                min_tracking_confidence=0.50,
                 output_segmentation_masks=False,
             )
             self.mp_landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
@@ -48,10 +56,10 @@ class PoseEstimator:
             if hasattr(mp, "solutions"):
                 self.mp_pose = mp.solutions.pose.Pose(
                     static_image_mode=False,
-                    model_complexity=1,
+                    model_complexity=2,
                     enable_segmentation=False,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5,
+                    min_detection_confidence=0.45,
+                    min_tracking_confidence=0.50,
                 )
                 self.mp_connections = mp.solutions.pose.POSE_CONNECTIONS
                 print(">>> MediaPipe Legacy Pose initialized (Single-pose only)")
@@ -143,6 +151,41 @@ class PoseEstimator:
             return False, None
         return self.cap.read()
 
+    @staticmethod
+    def _pose_center(kpts):
+        """用髋/肩中心作为跨帧选人的稳定锚点。"""
+        if kpts is None:
+            return None
+        pts = []
+        for idx in (23, 24, 11, 12):
+            if idx < len(kpts) and not np.allclose(kpts[idx], 0):
+                pts.append(kpts[idx])
+        if not pts:
+            return None
+        return np.mean(np.asarray(pts, dtype=np.float32), axis=0)
+
+    def _choose_stable_pose(self, poses):
+        """多人体时优先选择与上一帧躯干中心最接近的人，避免 result[0] 跳人。"""
+        if not poses:
+            return None
+        if len(poses) == 1 or self._last_pose_center is None:
+            chosen = poses[0]
+        else:
+            scored = []
+            for pose in poses:
+                center = self._pose_center(pose)
+                if center is None:
+                    dist = 1e9
+                else:
+                    dist = float(np.linalg.norm(center - self._last_pose_center))
+                scored.append((dist, pose))
+            scored.sort(key=lambda item: item[0])
+            chosen = scored[0][1]
+        center = self._pose_center(chosen)
+        if center is not None:
+            self._last_pose_center = center
+        return chosen
+
     def infer_keypoints(self, frame):
         self.person_count = 0
         self.all_kpts_list = []
@@ -156,14 +199,18 @@ class PoseEstimator:
             self.person_count = 1
             kpts = np.zeros((33, 2), dtype=np.float32)
             for idx, lm in enumerate(out.pose_landmarks.landmark):
-                if float(getattr(lm, "visibility", 1.0)) < 0.5:
+                visibility_threshold = (self._foot_visibility_threshold
+                                        if idx in self._foot_landmark_ids
+                                        else self._body_visibility_threshold)
+                if float(getattr(lm, "visibility", 1.0)) < visibility_threshold:
                     continue
                 x = float(lm.x) * w
                 y = float(lm.y) * h
                 if 0 <= x < w and 0 <= y < h:
                     kpts[idx] = (x, y)
             self.all_kpts_list.append(kpts)
-            return kpts
+            chosen = self._choose_stable_pose(self.all_kpts_list)
+            return chosen
 
         if self.mp_landmarker is not None:
             h, w = frame.shape[:2]
@@ -180,11 +227,23 @@ class PoseEstimator:
             for landmarks in result.pose_landmarks:
                 person_kpts = np.zeros((33, 2), dtype=np.float32)
                 for idx, lm in enumerate(landmarks):
-                    if float(getattr(lm, "visibility", 1.0)) < 0.5:
+                    visibility_threshold = (self._foot_visibility_threshold
+                                            if idx in self._foot_landmark_ids
+                                            else self._body_visibility_threshold)
+                    if float(getattr(lm, "visibility", 1.0)) < visibility_threshold:
                         continue
-                    person_kpts[idx] = (float(lm.x) * w, float(lm.y) * h)
+                    x = float(lm.x) * w
+                    y = float(lm.y) * h
+                    if 0 <= x < w and 0 <= y < h:
+                        person_kpts[idx] = (x, y)
                 self.all_kpts_list.append(person_kpts)
-            return self.all_kpts_list[0]
+            chosen = self._choose_stable_pose(self.all_kpts_list)
+            if chosen is None:
+                return None
+            # 保留全部人体用于调试绘制，但把本帧选中的运动员放在第一个，
+            # 后续逻辑始终使用返回的 chosen。
+            self.all_kpts_list = [chosen] + [p for p in self.all_kpts_list if p is not chosen]
+            return chosen
         return None
 
     def release(self):
